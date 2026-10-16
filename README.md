@@ -1,0 +1,261 @@
+# Picai — 本地 AI 图片编辑
+
+面向桌面浏览器的**单用户本地** AI 图片编辑应用：高质量 AI 抠图、语义对象分割、蒙版编辑、颜色/渐变替换、邻域填充，以及**支持多分支的历史版本树**。
+
+所有图片编辑与 AI 推理均在本机完成，**不会将图片发送到任何第三方服务**。
+
+## 功能总览
+
+| 模块 | 功能 |
+|---|---|
+| 画布 | 拖放/粘贴导入（PNG/JPEG/WebP）、滚轮缩放（锚定鼠标）、空格/中键平移、适应窗口、100%、居中、查看原图对比（不改变编辑状态） |
+| 项目与图片库 | 导入图片自动新建项目；项目重命名 / 切换 / 新建；项目内多图片（导入可多选 / 粘贴 / 空白图片）切换编辑；图片库**当前项目图片优先展示**，跨项目图片复制其当前结果到当前项目后打开；旧版单项目数据自动迁移 |
+| 图片合成 | 「插入图片」：将项目内或其他项目的图片叠加到当前画布，拖动定位、缩放调节，确认后合入并生成「插入图片」历史节点（空白图片 + 插入 = 简单拼贴） |
+| 选区 | 圆形/方形画笔（连续笔迹、硬度、[ ] 调整尺寸）、矩形/椭圆选区、魔棒颜色选择（容差、连续/非连续）、全选/反选/清空、增/减/交集组合 |
+| 区域（固定/解锁） | 保存当前选区为命名区域（缩略图列表，默认不保存）；**固定**的区域在后续编辑操作中自动并集；「并集 / 交集」手动合并（默认并集）；区域随项目持久化 |
+| AI 分割 | **BiRefNet** 自动抠图（前景/背景）；**SAM 3** 文本概念分割（如 person、sky、cat）；**SAM 3 Tracker** 点选/框选交互分割；AI 蒙版可继续用画笔修改 |
+| 蒙版后处理 | 羽化、膨胀、收缩、边缘平滑（仅影响蒙版，不破坏原图） |
+| 填充与替换 | 透明化（PNG 保留 Alpha）、纯色替换、线性渐变替换（起止色/方向/范围）、邻域渐变填充（OpenCV Telea，界面注明为邻域估算） |
+| 历史 | **多分支有根历史树 + 水平版本图**（从左到右、节点缩略图、分支连线）；点击节点查看大图并可恢复该版本；撤销后继续编辑产生新分支，A→B→C 撤销回 A→D→E 后 C 仍可访问 |
+| 持久化 | 项目 / 图片 / 全部历史快照 / 区域 / 最近打开状态写入 IndexedDB（多项目 schema，Blob 直存）；刷新/重启自动恢复；未保存提醒（含离开页面）与 Ctrl+S；存储用量显示 |
+| 导出 | PNG（透明通道）/ JPEG（透明铺底色）/ WebP；始终保持原始分辨率，不导出画布截图 |
+
+## 技术栈与目录结构
+
+前端 **Vue 3 + TypeScript + Vite + Pinia + Element Plus**（原生 Canvas 自研视口，不用 Canvas 封装库）；
+后端 **Python + FastAPI + PyTorch + Pillow + NumPy + OpenCV**。
+
+```
+Picai/
+├── backend/                    # FastAPI 后端
+│   ├── app/
+│   │   ├── main.py             # 入口（含前端构建产物托管）
+│   │   ├── core/config.py      # 路径、代理、设备、模型 ID 配置
+│   │   ├── api/                # 路由：system / segmentation / edit
+│   │   ├── adapters/           # 模型适配器：base / birefnet / sam3（含 Tracker）
+│   │   └── services/           # 任务管理、模型管理、分割服务、图像服务
+│   ├── tests/                  # pytest 测试
+│   └── requirements*.txt
+├── frontend/                   # Vue 3 前端
+│   ├── src/
+│   │   ├── core/               # Viewport / CanvasRenderer / SelectionManager /
+│   │   │                       # MaskRenderer / EditOperations / HistoryManager /
+│   │   │                       # ProjectStorage / ExportService / pixelOps
+│   │   ├── workers/pixel.worker.ts  # 像素运算 Worker（编辑/魔棒/形态学）
+│   │   ├── stores/editor.ts    # Pinia 状态编排
+│   │   ├── components/         # AppLayout / 工具栏 / ImageViewport / 属性面板 / 历史面板
+│   │   └── api/client.ts       # API 客户端（任务轮询）
+│   └── tests/                  # vitest 测试
+├── models/                     # 模型权重（不纳入 git）
+│   ├── sam3/                   # SAM 3 本地权重（魔搭下载）
+│   └── hf-cache/               # HuggingFace 缓存（BiRefNet）
+├── scripts/                    # 安装/下载/启动脚本
+├── test-assets/                # 测试图片（自动生成）
+└── .env                        # 本地代理配置（不纳入 git）
+```
+
+## 环境要求
+
+- Windows / macOS / Linux，桌面浏览器（Chrome / Edge 推荐）
+- Python 3.12（推荐）与 Node.js 18+
+- 可选：NVIDIA GPU + 驱动（本项目在 RTX 5080 Laptop 16GB 上开发验证，`torch 2.11.0+cu128`）
+- 磁盘：模型约 4GB（BiRefNet ~0.4GB、SAM 3 ~3.4GB）
+
+## 安装
+
+### 1. Python 环境（项目内虚拟环境）
+
+```bash
+cd Picai
+python -m venv .venv
+# GPU（CUDA 12.8+ 轮子，Blackwell/RTX 50 系必须）
+.venv/Scripts/python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# 仅 CPU 环境：pip install torch torchvision
+.venv/Scripts/python.exe -m pip install -r backend/requirements.txt
+.venv/Scripts/python.exe -m pip install -r backend/requirements-ai.txt
+```
+
+> GPU 检查：启动后端后访问 `http://127.0.0.1:8000/api/device`，或查看界面底部状态栏；
+> 显示「GPU 就绪：NVIDIA ...」即为 CUDA 可用，否则自动回退 CPU（速度较慢）。
+
+### 2. 前端依赖
+
+```bash
+cd frontend
+npm install
+```
+
+### 3. 模型下载
+
+**BiRefNet（自动抠图，HuggingFace，MIT 许可，约 0.4GB）**：
+
+```bash
+.venv/Scripts/python.exe scripts/download_models.py birefnet
+```
+
+**SAM 3（文本/点选/框选分割，约 3.4GB）**：推荐使用魔搭（ModelScope）下载（国内直连快、无需 HF 授权）：
+
+```bash
+.venv/Scripts/modelscope.exe download --model facebook/sam3 ^
+  --include "*.json" "*.txt" "*.md" "*.safetensors" "LICENSE" --local_dir models/sam3
+```
+
+> 若无法访问 huggingface.co，可在 `.env` 中配置本地代理（见下），BiRefNet 会自动经代理下载。
+> `modelscope` 由 `pip install modelscope` 安装（已包含在安装步骤中，如未安装请补装）。
+
+### 4. 代理配置（可选）
+
+复制 `.env.example` 为 `.env`，按需修改：
+
+```ini
+# 模型下载代理（留空直连）；仅在下载模型时使用
+PICAI_HF_PROXY=http://127.0.0.1:17890
+# 推理设备偏好
+PICAI_DEVICE_PREFERENCE=cuda
+```
+
+## 启动
+
+**开发模式**（两个终端）：
+
+```bash
+# 终端 1：后端（http://127.0.0.1:8000）
+cd backend && ../.venv/Scripts/python.exe -m uvicorn app.main:app --port 8000
+
+# 终端 2：前端（http://localhost:5173，/api 自动代理到后端）
+cd frontend && npm run dev
+```
+
+**生产模式**（单服务）：
+
+```bash
+cd frontend && npm run build        # 产物输出到 frontend/dist
+cd ../backend && ../.venv/Scripts/python.exe -m uvicorn app.main:app --port 8000
+# 浏览器打开 http://127.0.0.1:8000（后端自动托管前端构建产物）
+```
+
+Windows 用户也可直接使用 `scripts/start-all.bat`（双击后同时启动前后端）等脚本。
+
+## 使用说明
+
+1. **项目与图片库**（顶部第一个按钮 / Ctrl+O）：
+   - 导入图片（可多选）、粘贴（Ctrl+V）会自动加入**当前项目**；没有项目时自动新建；
+   - 项目下拉框可切换项目，「重命名 / 新建项目」管理项目；
+   - 「新建空白图片」：自定义尺寸与背景（透明/白色/任意色），加入项目后可编辑或用于拼贴；
+   - 其他项目折叠区中的图片：点击后**复制其当前编辑结果**到当前项目并打开（各项目数据独立）。
+2. **插入图片（画布合成）**：顶部「插入图片」→ 在图片库选择一张图（当前项目优先）→ 在画布上叠加显示，拖动调整位置、滑杆调节缩放 → 「确认插入」合入画布并生成历史节点（可撤销）；Esc 取消。
+3. **选区**：
+   - 画笔涂抹（`[` `]` 调尺寸，Alt 拖动临时减去，Shift 临时增加）；
+   - 矩形/椭圆拖动创建（Shift 约束正形；拖动时 Shift 加选、Alt 减选、Shift+Alt 交集）；
+   - 魔棒点击取色选区（右侧调容差与连续/非连续模式，Shift/Alt 加选/减选）。
+4. **区域（固定/解锁）**：右侧「区域」区块——「保存当前选区为区域」后：
+   - 「固定」：该区域在之后的透明化/纯色/渐变/邻域填充等编辑操作中自动并集进有效选区（如先固定人像，再手动选签名，一次替换两者）；
+   - 「并集 / 交集」：把区域手动合并进当前选区（默认并集语义）；
+   - 区域随项目保存，删除需显式点击。
+5. **AI 分割**（需后端运行）：
+   - 自动抠图：一键前景蒙版，「反选」得到背景选区；
+   - 自动对象选择：输入描述词（如 person、sky、cat、car）分割所有匹配对象；
+   - 点选/框选：在目标上点几下或拖框，微调后点「执行分割」；
+   - 首次运行需加载模型（SAM 3 约 10-20 秒），运行期间模型常驻复用；可在状态栏看到进度并「取消任务」。
+6. **蒙版后处理**：羽化 / 膨胀 / 收缩 / 边缘平滑，可反复叠加再编辑。
+7. **填充**：透明化、纯色替换、渐变替换、邻域渐变填充（先建选区再执行）。
+8. **历史版本图**：顶部撤销/重做之间是入口（如 `3/7`）——水平版本图从左到右展示，节点下方为缩略图，连线表示版本流向，分叉即分支；**点击节点可查看大图并一键恢复该版本**。撤销后继续编辑会产生新分支，旧分支不会被删除。
+9. **保存与导出**：
+   - 「保存项目」（Ctrl+S）= 当前项目的全部图片、历史分支与区域持久化到 IndexedDB（刷新/重启自动恢复；未保存有状态栏提示，离开页面时浏览器会提醒）；
+   - 「导出图片」= 生成 PNG/JPEG/WebP 文件（原始分辨率；JPEG 可设置透明区域铺底色）。
+
+### 快捷键
+
+| 快捷键 | 功能 |
+|---|---|
+| Ctrl+Z / Ctrl+Shift+Z | 撤销 / 重做 |
+| Ctrl+S | 保存项目 |
+| Ctrl+O | 打开图片库 |
+| Ctrl+V | 粘贴图片（加入当前项目） |
+| 空格+拖动 / 中键拖动 | 平移画布 |
+| 滚轮 | 以鼠标为锚点缩放 |
+| Ctrl+0 / Ctrl+1 | 适应窗口 / 100% |
+| Ctrl+A / Ctrl+D / Ctrl+I | 全选 / 清空选区 / 反选 |
+| `[` `]` | 画笔缩小 / 放大 |
+
+## 模型与许可说明
+
+| 模型 | 用途 | 来源 | 许可 | 说明 |
+|---|---|---|---|---|
+| [ZhengPeng7/BiRefNet](https://huggingface.co/ZhengPeng7/BiRefNet) | 自动抠图 | HuggingFace 官方（可直连/代理） | MIT | 自定义代码通过 `trust_remote_code` 加载（含 `birefnet.py`） |
+| [facebook/sam3](https://huggingface.co/facebook/sam3) | 文本概念分割（Sam3Model）、点选/框选交互分割（Sam3TrackerModel） | 本项目经**魔搭 ModelScope** 获取本地权重 | **Meta SAM License**（HF 上为 gated:manual，需同意许可后申请） | 权重仅供本地使用；商用请查阅并遵守 [SAM License](https://huggingface.co/facebook/sam3/blob/main/LICENSE) 条款 |
+| facebook/sam2.1-hiera-large / IDEA-Research/grounding-dino-base | 备选分割方案（当前未启用） | HuggingFace | Apache-2.0 | 如需在 SAM 3 不可用时回退，可按相同适配器接口扩展 |
+
+依赖栈许可：PyTorch（BSD-3）、transformers（Apache-2.0）、OpenCV（Apache-2.0）、Vue/Element Plus（MIT）。
+
+## 数据结构说明
+
+### 选区蒙版
+
+- 统一为**全分辨率灰度蒙版**：0 = 未选中、255 = 完全选中，中间值为软边缘权重；
+- 运行时以「白色 + Alpha=灰度」的全尺寸画布承载，使画布的 `source-over / destination-out / destination-in` 复合运算**直接等价**于选区的增加/减去/交集；
+- 与后端/Worker 交换时转换为单通道灰度（PNG 或原始字节数组）；导出编辑结果时按蒙版权重逐像素混合，**软边缘不做阈值化**。
+
+### 历史树（HistoryManager）
+
+- 有根树：原图为不可变的根节点；每个已确认的图像修改生成一个子节点；
+- 节点字段：`id`、`parentId`、`childIds[]`、`op`（类型+参数）、`time`、`imageBlob`（全分辨率 PNG 快照）、`thumbBlob`（缩略图）、`label`；
+- 当前节点只是活动指针：撤销 = 移动到父节点；在非叶子处新增编辑 = 创建新分支（旧分支永久保留）；重做默认进入最近子节点，可在面板中显式选择分支；
+- 鼠标移动、临时预览、查看原图等**不产生**历史节点。
+
+### IndexedDB（ProjectStorage，多项目 schema v3）
+
+- 数据库 `picai`，五个对象仓库：
+  - `projects`：项目元数据（名称、时间戳）；
+  - `images`：项目内图片（原图 Blob、当前版本 id、缩略图、来源备注，按 `projectId` 索引）；
+  - `nodes`：每张图片的历史树节点（`dbKey = 图片id:节点id`，含快照 Blob，按 `imageId` 索引）；
+  - `regions`：每张图片保存的区域（灰度蒙版 Blob、名称、固定状态、顺序）；
+  - `app_state`：最近打开的项目/图片（启动时自动恢复）；
+- 所有 Blob 直接结构化克隆存储，**无 Base64 转换**；
+- 旧版（v1 单项目）数据在首次打开时**自动迁移**为多项目结构（原数据不丢失）；
+- 恢复失败（数据损坏等）不会清空存储，界面给出明确错误；存储配额不足（`QuotaExceededError`）有专门提示。
+
+## 测试
+
+```bash
+# 前端（vitest）：画布坐标映射、蒙版组合与权重、羽化/形态学、魔棒、渐变、历史树分支、项目持久化
+cd frontend && npm test
+
+# 后端（pytest）：任务管理（成功/失败/取消/超时）、蒙版编码、邻域填充隔离性
+cd backend && ../.venv/Scripts/python.exe -m pytest tests -q
+```
+
+当前结果：前端 **37 个测试通过**，后端 **10 个测试通过**；另在 3840×2160 测试图上完成 AI 抠图/文本分割/点选/框选/邻域填充的端到端实测（见「验收记录」）。
+
+## 常见错误
+
+| 现象 | 原因与解决 |
+|---|---|
+| 状态栏显示「后端未启动」 | 后端未运行：按「启动」一节启动 uvicorn；AI 功能需要后端 |
+| 「PyTorch 未安装」 | 未安装 torch：按安装步骤 1 执行（注意 GPU 版本 index-url） |
+| 「CUDA 不可用（CPU 推理）」 | 驱动/显卡不支持 CUDA 或装了 CPU 版 torch；CPU 也可运行但较慢 |
+| BIReFNet 加载失败/下载慢 | 检查 `.env` 的 `PICAI_HF_PROXY`；或先运行 `scripts/download_models.py birefnet` |
+| SAM 3 加载失败 | 确认 `models/sam3/model.safetensors` 完整（3.4GB），缺失时按安装步骤 3 用魔搭重新下载 |
+| 「图片尺寸超出浏览器画布上限」 | 单边超过 16384px 的图片无法编辑（浏览器限制） |
+| 保存项目报「存储空间不足」 | 浏览器配额耗尽：导出图片后清理项目存储/浏览器空间；历史快照为全分辨率，节点多时占用较大 |
+| 页面刷新后没有恢复项目 | 仅恢复「已保存」的项目；未保存的改动请先点「保存项目」 |
+| 前端依赖安装慢 | 可配置 npm 镜像：`npm config set registry https://registry.npmmirror.com` |
+
+## 已知限制
+
+- 「插入图片」为**位图合入**（合入后即成为画布像素的一部分），非图层系统；插入后需用撤销回退；
+- 暂不支持删除图片/项目（删除会涉及历史与区域级联清理，后续版本补充）；
+- 区域（固定/解锁）按图片保存，不跨图片共享；
+- 邻域渐变填充为**邻域颜色估算**（OpenCV Telea），不是生成式内容修复，复杂纹理区域效果有限；
+- 未实现图层系统与物体移除/生成式填充（已预留适配器与操作扩展接口）；
+- 任务状态保存在后端内存中，重启后端会清空进行中的任务（已完成的编辑不受影响）。
+
+## 验收记录（摘要）
+
+在 3840×2160 测试图上完成的关键实测（2026-10-16，RTX 5080 Laptop）：
+
+- BiRefNet 抠图：前景/背景分割正确；经 API 的蒙版与独立推理结果逐像素一致（平均差值 0.0）；
+- SAM 3 文本分割：`yellow circle` → 蒙版范围与图中目标区域精确吻合（质心偏差 ≤1px）；
+- SAM 3 点选/框选：点击/框选目标后蒙版质心与范围精确一致；
+- 邻域填充：选区外像素变化严格为 0（未选中区域不被修改）；
+- 单元测试与类型检查：前端 37 通过、后端 10 通过、`vue-tsc` 无错误。

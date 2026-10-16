@@ -1,0 +1,390 @@
+:root {
+  font-family: system-ui, 'Microsoft YaHei', 'PingFang SC', 'Segoe UI', sans-serif;
+  font-size: 14px;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  background: #141416;
+}
+
+/* ---------- 整体布局 ---------- */
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.app-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.canvas-area {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  position: relative;
+}
+
+/* ---------- 顶部工具栏 ---------- */
+.top-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: #232327;
+  border-bottom: 1px solid #35353b;
+}
+
+.top-toolbar .group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.top-toolbar .divider {
+  width: 1px;
+  height: 22px;
+  background: #3a3a40;
+  margin: 0 4px;
+}
+
+.top-toolbar .spacer {
+  flex: 1;
+}
+
+.zoom-label {
+  min-width: 52px;
+  text-align: center;
+  color: #b9b9c3;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- 侧栏 ---------- */
+.side-bar {
+  display: flex;
+  background: #232327;
+  border-right: 1px solid #35353b;
+}
+
+.side-bar.right {
+  border-right: none;
+  border-left: 1px solid #35353b;
+}
+
+.side-bar .collapse-btn {
+  width: 14px;
+  border: none;
+  background: #2b2b31;
+  color: #9a9aa5;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0;
+  flex: none;
+}
+
+.side-bar .collapse-btn:hover {
+  background: #35353b;
+  color: #ffffff;
+}
+
+/* ---------- 左侧工具栏 ---------- */
+.left-toolbar {
+  width: 54px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 0;
+}
+
+.tool-sep {
+  width: 28px;
+  height: 1px;
+  background: #3a3a40;
+  margin: 6px 0;
+}
+
+.tool-btn {
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: #c9c9d1;
+  cursor: pointer;
+  padding: 0;
+}
+
+.tool-btn:hover:not(.disabled) {
+  background: #2e2e35;
+}
+
+.tool-btn.active {
+  background: #2b3f63;
+  border-color: #3b82f6;
+  color: #7db4ff;
+}
+
+.tool-btn.disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.tool-btn svg {
+  width: 22px;
+  height: 22px;
+  display: block;
+}
+
+/* ---------- 右侧属性面板 ---------- */
+.right-panel {
+  width: 296px;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.panel-section {
+  background: #26262b;
+  border: 1px solid #35353b;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.panel-section h4 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: #d6d6de;
+  font-weight: 600;
+}
+
+.panel-section .field {
+  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.panel-section .field > label {
+  font-size: 12px;
+  color: #9a9aa5;
+}
+
+.panel-section .row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.panel-section .hint {
+  font-size: 12px;
+  color: #8a8a94;
+  margin: 6px 0 0;
+  line-height: 1.5;
+}
+
+.hint-inline {
+  margin-left: 8px;
+  font-size: 12px;
+  color: #8a8a94;
+}
+
+/* ---------- 画布视口 ---------- */
+.image-viewport {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #141416;
+  touch-action: none;
+}
+
+.viewport-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.empty-hint {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: #8a8a94;
+  pointer-events: none;
+}
+
+.empty-hint .sub {
+  font-size: 12px;
+  color: #6f6f78;
+  margin: 0;
+}
+
+.empty-hint p {
+  margin: 0;
+}
+
+.empty-hint .el-button {
+  pointer-events: auto;
+}
+
+.insert-bar {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px;
+  background: rgba(35, 35, 39, 0.94);
+  border: 1px solid #3b82f6;
+  border-radius: 10px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.45);
+  z-index: 5;
+}
+
+.insert-title {
+  font-size: 13px;
+  color: #e2e2e8;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.insert-label {
+  font-size: 12px;
+  color: #9aa0ab;
+}
+
+.insert-percent {
+  font-size: 12px;
+  color: #b9b9c3;
+  min-width: 44px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- 区域列表 ---------- */
+.region-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.region-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border: 1px solid #35353b;
+  border-radius: 6px;
+  background: #232327;
+}
+
+.region-thumb {
+  width: 40px;
+  height: 40px;
+  object-fit: contain;
+  border-radius: 4px;
+  background: #141416;
+  flex: none;
+}
+
+.region-thumb.placeholder {
+  background: #141416;
+}
+
+.region-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+
+.region-name {
+  font-size: 12px;
+  color: #e2e2e8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.region-lock-state {
+  font-size: 11px;
+  color: #8a8a94;
+}
+
+.region-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.region-actions .el-button {
+  padding: 2px 4px;
+  font-size: 12px;
+}
+
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(59, 130, 246, 0.12);
+  border: 2px dashed #3b82f6;
+  color: #9cc3ff;
+  font-size: 15px;
+  pointer-events: none;
+}
+
+/* ---------- 状态栏 ---------- */
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 10px;
+  background: #232327;
+  border-top: 1px solid #35353b;
+  font-size: 12px;
+  color: #a9a9b4;
+  min-height: 36px;
+}
+
+.status-bar .spacer {
+  flex: 1;
+}
+
+.status-bar .busy {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #7db4ff;
+}
+
+.status-bar .item {
+  font-variant-numeric: tabular-nums;
+}

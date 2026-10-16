@@ -1,0 +1,8 @@
+# AI 推理依赖（阶段二起使用）
+# 安装前先装好 PyTorch（见 requirements.txt 顶部说明）
+transformers>=4.50
+huggingface_hub>=0.27
+safetensors>=0.4
+timm>=1.0
+einops>=0.8
+kornia>=0.7
