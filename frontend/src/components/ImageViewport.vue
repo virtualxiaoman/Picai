@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watchEffect } from 'vue';
 import { ElMessage } from 'element-plus';
 import { useEditorStore } from '../stores/editor';
 import { CanvasRenderer, type ToolPreview } from '../core/CanvasRenderer';
-import type { CombineMode } from '../types';
+import { resolveCombineMode } from '../core/modifiers';
 
 const store = useEditorStore();
 const containerRef = ref<HTMLDivElement | null>(null);
@@ -22,7 +22,11 @@ let insertLast = { x: 0, y: 0 };
 
 const insertScalePercent = computed({
   get: () => Math.round(store.insertScale * 100),
-  set: (value: number) => store.setInsertScale(value / 100),
+  set: (value: number) => {
+    // 输入框被清空时 el-input-number 会传出 null，忽略避免跳到最小值
+    if (typeof value !== 'number' || !Number.isFinite(value)) return;
+    store.setInsertScale(value / 100);
+  },
 });
 
 const isBrushTool = computed(
@@ -34,6 +38,7 @@ const isMarqueeTool = computed(
 
 const previews = computed<ToolPreview[]>(() => {
   const list: ToolPreview[] = [];
+  if (store.showRegions) return list; // 区域查看模式下不绘制任何工具预览
   if (store.insertState) {
     const s = store.insertState;
     list.push({
@@ -77,6 +82,8 @@ const previews = computed<ToolPreview[]>(() => {
 });
 
 const cursorStyle = computed(() => {
+  if (store.colorPickActive) return 'crosshair';
+  if (store.showRegions) return 'default';
   if (store.insertState) return drag.value === 'insert' ? 'grabbing' : 'move';
   if (drag.value === 'pan') return 'grabbing';
   if (spaceDown.value) return 'grab';
@@ -107,20 +114,27 @@ function doRender(): void {
   const canvas = canvasRef.value;
   const container = containerRef.value;
   if (!canvas || !container) return;
+  const regionsView = store.showRegions ? store.getRegionsViewCanvas() : null;
   const maskManager = store.getMaskManager();
   const maskRenderer = store.getMaskRenderer();
   let overlay: HTMLCanvasElement | null = null;
-  if (maskManager && maskRenderer && !store.showOriginal) {
-    maskRenderer.update(maskManager.canvas, maskManager.version);
-    overlay = maskRenderer.canvas;
+  let differenceMask: HTMLCanvasElement | null = null;
+  if (maskManager && maskRenderer && !store.showOriginal && !store.showRegions) {
+    if (store.maskDisplayMode === 'difference') {
+      differenceMask = maskManager.canvas;
+    } else {
+      maskRenderer.update(maskManager.canvas, maskManager.version);
+      overlay = maskRenderer.canvas;
+    }
   }
+  const image = (regionsView ??
+    (store.showOriginal ? store.originalBitmap : store.getEditedCanvas())) as CanvasImageSource | null;
   renderer.render(canvas, container.clientWidth, container.clientHeight, {
     viewport: store.getViewport(),
     dpr: window.devicePixelRatio || 1,
-    image: (store.showOriginal ? store.originalBitmap : store.getEditedCanvas()) as
-      | CanvasImageSource
-      | null,
+    image,
     overlay,
+    differenceMask,
     preview: previews.value,
   });
 }
@@ -135,6 +149,8 @@ watchEffect(() => {
   void store.viewWidth;
   void store.viewHeight;
   void store.showOriginal;
+  void store.showRegions;
+  void store.maskDisplayMode;
   void store.insertState;
   void previews.value;
   requestRender();
@@ -163,9 +179,14 @@ function onPointerDown(event: PointerEvent): void {
     return;
   }
   if (event.button !== 0) return;
-  if (!store.hasImage || store.busy || store.showOriginal) return;
+  if (!store.hasImage || store.busy || store.showOriginal || store.showRegions) return;
 
   const img = store.getViewport().toImage(screen);
+  // 取色模式：点击画布采样颜色（色彩靠近的目标色）
+  if (store.colorPickActive) {
+    store.pickColorAt(img.x, img.y);
+    return;
+  }
   // 插入模式：拖动调整插入图片的位置
   if (store.insertState) {
     const rect = store.insertState.rect;
@@ -181,7 +202,8 @@ function onPointerDown(event: PointerEvent): void {
     return;
   }
   if (isBrushTool.value) {
-    const mode: CombineMode = event.altKey ? 'subtract' : event.shiftKey ? 'add' : store.brushMode;
+    // Ctrl / Shift = 并集，Alt = 减去（与魔棒、几何选区统一）
+    const mode = resolveCombineMode(event, store.brushMode);
     store.startBrushStroke(store.activeTool === 'brush-circle' ? 'circle' : 'square', mode);
     store.brushStrokeTo(img.x, img.y);
     drag.value = 'brush';
@@ -197,7 +219,8 @@ function onPointerDown(event: PointerEvent): void {
     drag.value = 'ai-point';
     requestRender();
   } else if (store.activeTool === 'magic-wand') {
-    const mode: CombineMode = event.altKey ? 'subtract' : event.shiftKey ? 'add' : 'new';
+    // Ctrl / Shift = 与现有选区并集，Alt = 减去
+    const mode = resolveCombineMode(event, 'new');
     void store.magicWandAt(img.x, img.y, mode);
   }
 }
@@ -259,10 +282,7 @@ function onPointerUp(event: PointerEvent): void {
   } else if (drag.value === 'marquee' && marqueeRect.value) {
     const rect = marqueeRect.value;
     if (rect.width >= 1 && rect.height >= 1) {
-      let mode: CombineMode = store.marqueeMode;
-      if (event.shiftKey && event.altKey) mode = 'intersect';
-      else if (event.shiftKey) mode = 'add';
-      else if (event.altKey) mode = 'subtract';
+      const mode = resolveCombineMode(event, store.marqueeMode);
       store.commitMarquee(
         store.activeTool === 'marquee-ellipse' ? 'ellipse' : 'rect',
         rect,
@@ -324,9 +344,15 @@ function isEditingTarget(target: EventTarget | null): boolean {
 
 function onKeyDown(event: KeyboardEvent): void {
   if (isEditingTarget(event.target)) return;
-  if (event.key === 'Escape' && store.insertState) {
-    store.cancelInsert();
-    return;
+  if (event.key === 'Escape') {
+    if (store.insertState) {
+      store.cancelInsert();
+      return;
+    }
+    if (store.colorPickActive) {
+      store.cancelColorPick();
+      return;
+    }
   }
   if (event.code === 'Space' && !event.repeat) {
     spaceDown.value = true;
@@ -403,8 +429,16 @@ onBeforeUnmount(() => {
     <div v-if="store.insertState" class="insert-bar">
       <span class="insert-title">插入「{{ store.insertState.sourceName }}」</span>
       <span class="insert-label">缩放</span>
-      <el-slider v-model="insertScalePercent" :min="5" :max="400" style="width: 150px" />
-      <span class="insert-percent">{{ insertScalePercent }}%</span>
+      <el-slider v-model="insertScalePercent" :min="5" :max="400" style="width: 130px" />
+      <el-input-number
+        v-model="insertScalePercent"
+        :min="5"
+        :max="400"
+        size="small"
+        controls-position="right"
+        style="width: 96px"
+      />
+      <span class="insert-percent">%</span>
       <el-button size="small" type="primary" :disabled="store.busy" @click="store.confirmInsert()">
         确认插入
       </el-button>

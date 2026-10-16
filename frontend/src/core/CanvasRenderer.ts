@@ -46,8 +46,10 @@ export interface RenderState {
   viewport: Viewport;
   dpr: number;
   image: CanvasImageSource | null;
-  /** 蒙版着色层（查看原图时为 null） */
+  /** 蒙版着色层（填色模式；查看原图/查看区域时为 null） */
   overlay: HTMLCanvasElement | null;
+  /** 差分模式：原始蒙版画布（白色+Alpha），以 difference 合成显示为底色反相 */
+  differenceMask?: HTMLCanvasElement | null;
   preview: ToolPreview[];
 }
 
@@ -104,7 +106,14 @@ export class CanvasRenderer {
     ctx.imageSmoothingEnabled = smooth;
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(state.image, rx, ry, rw, rh);
-    if (state.overlay) ctx.drawImage(state.overlay, rx, ry, rw, rh);
+    if (state.differenceMask) {
+      // 差分：|底色 - 白色| = 反相；软边缘按 Alpha 自然过渡
+      ctx.globalCompositeOperation = 'difference';
+      ctx.drawImage(state.differenceMask, rx, ry, rw, rh);
+      ctx.globalCompositeOperation = 'source-over';
+    } else if (state.overlay) {
+      ctx.drawImage(state.overlay, rx, ry, rw, rh);
+    }
     ctx.restore();
 
     ctx.strokeStyle = 'rgba(255,255,255,0.22)';

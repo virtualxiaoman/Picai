@@ -33,7 +33,24 @@ export interface GradientFillOp {
   color2: [number, number, number];
 }
 
-export type PixelOp = TransparentOp | SolidFillOp | GradientFillOp;
+export type ColorShiftMode = 'offset' | 'hue' | 'match';
+
+/**
+ * 色彩靠近：把蒙版区域整体色彩朝目标色迁移，strength 控制靠近程度（0-1）。
+ * - offset 均值偏移：区域整体平移色彩，明暗纹理完全保留
+ * - hue 仅色相迁移：保留明度与饱和度，只把色相朝目标转动
+ * - match 分布匹配：颜色均值与色彩分布范围同时向目标对齐
+ *   （targetStd 为目标区域在 Lab 空间的颜色标准差；省略时按点色处理）
+ */
+export interface ColorShiftOp {
+  type: 'color_shift';
+  mode: ColorShiftMode;
+  target: [number, number, number];
+  targetStd?: [number, number, number];
+  strength: number;
+}
+
+export type PixelOp = TransparentOp | SolidFillOp | GradientFillOp | ColorShiftOp;
 
 export type MaskOpKind = 'feather' | 'dilate' | 'erode';
 

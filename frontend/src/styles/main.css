@@ -167,11 +167,42 @@ body {
   padding: 10px 12px;
 }
 
-.panel-section h4 {
-  margin: 0 0 8px;
-  font-size: 13px;
+.section-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
   color: #d6d6de;
+  font-size: 13px;
   font-weight: 600;
+  font-family: inherit;
+  text-align: left;
+}
+
+.section-header:hover {
+  color: #ffffff;
+}
+
+.section-caret {
+  font-size: 11px;
+  color: #8a8a94;
+  transition: transform 0.15s ease;
+  transform: rotate(-90deg);
+  flex: none;
+}
+
+.section-header.open .section-caret {
+  transform: rotate(0deg);
+}
+
+.section-body {
+  margin-top: 8px;
 }
 
 .panel-section .field {
@@ -286,12 +317,70 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* 面板区块标题的说明气泡（显示在面板左侧） */
+.panel-hint-tooltip {
+  max-width: 340px;
+  line-height: 1.6;
+}
+
+/* 参数滑杆 + 数值输入（ParamSlider 组件与内联用法共用） */
+.param-slider {
+  margin-bottom: 10px;
+}
+
+.param-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+
+.param-label {
+  font-size: 12px;
+  color: #9a9aa5;
+}
+
+.param-range {
+  font-size: 11px;
+  color: #6f6f78;
+}
+
+.param-input-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.param-input {
+  width: 104px;
+}
+
+.param-unit {
+  font-size: 12px;
+  color: #8a8a94;
+  min-width: 12px;
+}
+
+/* ---------- 色彩靠近 ---------- */
+.shift-swatch {
+  display: inline-block;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  border: 1px solid #4a4a52;
+  vertical-align: middle;
+  flex: none;
+}
+
 /* ---------- 区域列表 ---------- */
 .region-list {
   margin-top: 8px;
   display: flex;
   flex-direction: column;
   gap: 6px;
+  max-height: 226px;
+  overflow-y: auto;
 }
 
 .region-row {
@@ -302,6 +391,14 @@ body {
   border: 1px solid #35353b;
   border-radius: 6px;
   background: #232327;
+}
+
+.region-color-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex: none;
+  border: 1px solid rgba(255, 255, 255, 0.25);
 }
 
 .region-thumb {

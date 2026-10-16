@@ -6,8 +6,12 @@ import {
   featherGray,
   grayToRgba,
   hexToRgb,
+  labToRgb,
   magicWand,
+  maskedMeanColor,
+  maskedModeColor,
   morphGray,
+  rgbToLab,
 } from '../src/core/pixelOps';
 
 describe('applyPixelOp：编辑操作按蒙版权重计算', () => {
@@ -241,5 +245,233 @@ describe('hexToRgb', () => {
   });
   it('非法输入回退为黑色', () => {
     expect(hexToRgb('zzz')).toEqual([0, 0, 0]);
+  });
+});
+
+describe('rgbToLab / labToRgb：Lab 色彩空间转换', () => {
+  it('往返转换在 ±1 容差内一致', () => {
+    const colors: [number, number, number][] = [
+      [0, 0, 0],
+      [255, 255, 255],
+      [128, 128, 128],
+      [255, 0, 0],
+      [0, 255, 0],
+      [0, 0, 255],
+      [200, 150, 80],
+      [30, 40, 90],
+      [10, 200, 120],
+    ];
+    for (const color of colors) {
+      const back = labToRgb(...rgbToLab(color[0], color[1], color[2]));
+      expect(Math.abs(back[0] - color[0])).toBeLessThanOrEqual(1.5);
+      expect(Math.abs(back[1] - color[1])).toBeLessThanOrEqual(1.5);
+      expect(Math.abs(back[2] - color[2])).toBeLessThanOrEqual(1.5);
+    }
+  });
+
+  it('黑白 L 值在 [0, 100] 边界', () => {
+    expect(rgbToLab(0, 0, 0)[0]).toBeCloseTo(0, 1);
+    expect(rgbToLab(255, 255, 255)[0]).toBeCloseTo(100, 1);
+  });
+});
+
+describe('applyPixelOp color_shift：色彩靠近（保留原风格）', () => {
+  function fillPixels(count: number, rgb: [number, number, number]): Uint8ClampedArray {
+    const px = new Uint8ClampedArray(count * 4);
+    for (let i = 0; i < count; i++) {
+      px[i * 4] = rgb[0];
+      px[i * 4 + 1] = rgb[1];
+      px[i * 4 + 2] = rgb[2];
+      px[i * 4 + 3] = 255;
+    }
+    return px;
+  }
+
+  it('强度 0 时像素严格不变', () => {
+    const pixels = fillPixels(2, [200, 50, 50]);
+    const before = [...pixels];
+    applyPixelOp(
+      pixels,
+      new Uint8ClampedArray([255, 255]),
+      { type: 'color_shift', mode: 'offset', target: [50, 50, 200], strength: 0 },
+      2,
+      1,
+    );
+    expect([...pixels]).toEqual(before);
+  });
+
+  it('均匀区域强度 1 时颜色到达目标色（容差内）', () => {
+    const pixels = fillPixels(4, [200, 50, 50]);
+    applyPixelOp(
+      pixels,
+      new Uint8ClampedArray(4).fill(255),
+      { type: 'color_shift', mode: 'offset', target: [50, 50, 200], strength: 1 },
+      4,
+      1,
+    );
+    for (let i = 0; i < 4; i++) {
+      expect(Math.abs(pixels[i * 4] - 50)).toBeLessThanOrEqual(8);
+      expect(Math.abs(pixels[i * 4 + 1] - 50)).toBeLessThanOrEqual(8);
+      expect(Math.abs(pixels[i * 4 + 2] - 200)).toBeLessThanOrEqual(8);
+    }
+  });
+
+  it('保留像素间的明暗结构（差异基本不丢失）', () => {
+    // 两个不同亮度的红色像素
+    const pixels = new Uint8ClampedArray([220, 60, 60, 255, 120, 30, 30, 255]);
+    const mask = new Uint8ClampedArray([255, 255]);
+    applyPixelOp(
+      pixels,
+      mask,
+      { type: 'color_shift', mode: 'offset', target: [50, 50, 200], strength: 1 },
+      2,
+      1,
+    );
+    // 迁移后两像素仍保持明显的亮度差（结构保留），且都朝蓝色方向移动
+    const bright = pixels[0] + pixels[1] + pixels[2];
+    const dark = pixels[4] + pixels[5] + pixels[6];
+    expect(bright).toBeGreaterThan(dark + 100);
+    // 蓝色通道应显著提升（向蓝色靠近）
+    expect(pixels[2]).toBeGreaterThan(60);
+    expect(pixels[6]).toBeGreaterThan(30);
+  });
+
+  it('mask=0 的像素严格不变', () => {
+    const pixels = new Uint8ClampedArray([200, 50, 50, 255, 10, 20, 30, 255]);
+    applyPixelOp(
+      pixels,
+      new Uint8ClampedArray([255, 0]),
+      { type: 'color_shift', mode: 'offset', target: [50, 50, 200], strength: 1 },
+      2,
+      1,
+    );
+    expect([pixels[4], pixels[5], pixels[6]]).toEqual([10, 20, 30]);
+  });
+
+  it('仅色相模式：色相转向目标、明度与饱和度保留、灰像素不受影响', () => {
+    const orange: [number, number, number] = [200, 120, 40];
+    const pixels = new Uint8ClampedArray([...orange, 255, 128, 128, 128, 255]);
+    const mask = new Uint8ClampedArray([255, 255]);
+    applyPixelOp(
+      pixels,
+      mask,
+      { type: 'color_shift', mode: 'hue', target: [40, 80, 200], strength: 1 },
+      2,
+      1,
+    );
+    const lab0 = rgbToLab(...orange);
+    const lab1 = rgbToLab(pixels[0], pixels[1], pixels[2]);
+    const labT = rgbToLab(40, 80, 200);
+    // 色相到达目标附近
+    const hueOf = (lab: [number, number, number]): number => Math.atan2(lab[2], lab[1]);
+    expect(Math.abs(hueOf(lab1) - hueOf(labT))).toBeLessThan(0.12);
+    // 明度与饱和度保留
+    expect(Math.abs(lab1[0] - lab0[0])).toBeLessThan(3);
+    expect(Math.abs(Math.hypot(lab1[1], lab1[2]) - Math.hypot(lab0[1], lab0[2]))).toBeLessThan(6);
+    // 近灰色像素保持不变
+    expect(Math.abs(pixels[4] - 128)).toBeLessThanOrEqual(2);
+    expect(Math.abs(pixels[5] - 128)).toBeLessThanOrEqual(2);
+    expect(Math.abs(pixels[6] - 128)).toBeLessThanOrEqual(2);
+  });
+
+  it('分布匹配：目标统计等于自身统计时结果为原图（恒等变换）', () => {
+    const a: [number, number, number] = [200, 50, 50];
+    const b: [number, number, number] = [60, 20, 20];
+    const labA = rgbToLab(...a);
+    const labB = rgbToLab(...b);
+    const mean: [number, number, number] = [
+      (labA[0] + labB[0]) / 2,
+      (labA[1] + labB[1]) / 2,
+      (labA[2] + labB[2]) / 2,
+    ];
+    const std: [number, number, number] = [0, 1, 2].map((ch) =>
+      Math.sqrt(
+        Math.max(0, (Math.pow(labA[ch], 2) + Math.pow(labB[ch], 2)) / 2 - Math.pow(mean[ch], 2)),
+      ),
+    ) as [number, number, number];
+    // 目标色取「Lab 均值的 RGB 表示」，使目标统计与应用区域统计一致（恒等条件）
+    const target: [number, number, number] = labToRgb(...mean);
+    const pixels = new Uint8ClampedArray([...a, 255, ...b, 255]);
+    applyPixelOp(
+      pixels,
+      new Uint8ClampedArray([255, 255]),
+      { type: 'color_shift', mode: 'match', target, targetStd: std, strength: 1 },
+      2,
+      1,
+    );
+    expect(Math.abs(pixels[0] - a[0])).toBeLessThanOrEqual(3);
+    expect(Math.abs(pixels[1] - a[1])).toBeLessThanOrEqual(3);
+    expect(Math.abs(pixels[2] - a[2])).toBeLessThanOrEqual(3);
+    expect(Math.abs(pixels[4] - b[0])).toBeLessThanOrEqual(3);
+    expect(Math.abs(pixels[5] - b[1])).toBeLessThanOrEqual(3);
+    expect(Math.abs(pixels[6] - b[2])).toBeLessThanOrEqual(3);
+  });
+
+  it('分布匹配：目标为点色（零标准差）时强度 1 接近纯目标色', () => {
+    const pixels = new Uint8ClampedArray([200, 50, 50, 255, 60, 20, 20, 255]);
+    applyPixelOp(
+      pixels,
+      new Uint8ClampedArray([255, 255]),
+      { type: 'color_shift', mode: 'match', target: [50, 50, 200], strength: 1 },
+      2,
+      1,
+    );
+    for (const offset of [0, 4]) {
+      expect(Math.abs(pixels[offset] - 50)).toBeLessThanOrEqual(8);
+      expect(Math.abs(pixels[offset + 1] - 50)).toBeLessThanOrEqual(8);
+      expect(Math.abs(pixels[offset + 2] - 200)).toBeLessThanOrEqual(8);
+    }
+  });
+
+  it('强度 0.5 时均值靠近一半距离', () => {
+    const pixels = fillPixels(4, [200, 50, 50]);
+    const mask = new Uint8ClampedArray(4).fill(255);
+    const source = [...pixels];
+    applyPixelOp(pixels, mask, { type: 'color_shift', mode: 'offset', target: [50, 50, 200], strength: 0.5 }, 4, 1);
+    const fullShift = fillPixels(4, [200, 50, 50]);
+    applyPixelOp(fullShift, mask, { type: 'color_shift', mode: 'offset', target: [50, 50, 200], strength: 1 }, 4, 1);
+    // 半强度的位移量应约为全强度的一半（Lab 加性偏移的近似检查）
+    const moved = pixels[2] - source[2];
+    const movedFull = fullShift[2] - source[2];
+    expect(moved).toBeGreaterThan(movedFull * 0.35);
+    expect(moved).toBeLessThan(movedFull * 0.65);
+  });
+});
+
+describe('maskedMeanColor / maskedModeColor：区域颜色统计', () => {
+  it('均值：仅统计蒙版内的像素，软权重参与加权', () => {
+    const pixels = new Uint8ClampedArray([100, 0, 0, 255, 200, 0, 0, 255, 50, 50, 50, 255]);
+    const gray = new Uint8ClampedArray([255, 255, 0]);
+    expect(maskedMeanColor(pixels, gray)).toEqual([150, 0, 0]);
+    // 权重 255 与 128：结果偏向权重高的一侧
+    const weighted = maskedMeanColor(pixels, new Uint8ClampedArray([255, 128, 0]));
+    expect(weighted![0]).toBeGreaterThan(130);
+    expect(weighted![0]).toBeLessThan(150);
+  });
+
+  it('全零蒙版返回 null', () => {
+    const pixels = new Uint8ClampedArray([1, 2, 3, 255]);
+    expect(maskedMeanColor(pixels, new Uint8ClampedArray([0]))).toBeNull();
+    expect(maskedModeColor(pixels, new Uint8ClampedArray([0]))).toBeNull();
+  });
+
+  it('众数：数量占优的颜色块胜出（忽略少量杂色）', () => {
+    // 5 个红系（同色块）+ 3 个蓝系
+    const px = new Uint8ClampedArray(8 * 4);
+    const gray = new Uint8ClampedArray(8).fill(255);
+    for (let i = 0; i < 5; i++) {
+      px[i * 4] = 200;
+      px[i * 4 + 1] = 30;
+      px[i * 4 + 2] = 30;
+      px[i * 4 + 3] = 255;
+    }
+    for (let i = 5; i < 8; i++) {
+      px[i * 4] = 30;
+      px[i * 4 + 1] = 30;
+      px[i * 4 + 2] = 200;
+      px[i * 4 + 3] = 255;
+    }
+    const mode = maskedModeColor(px, gray);
+    expect(mode![0]).toBeGreaterThan(mode![2]); // 红占优
   });
 });

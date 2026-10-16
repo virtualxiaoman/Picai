@@ -1,25 +1,23 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed } from 'vue';
 import { useEditorStore } from '../stores/editor';
-import type { ExportFormat } from '../types';
+import ParamSlider from './ParamSlider.vue';
 
 const props = defineProps<{ modelValue: boolean }>();
 const emit = defineEmits<{ (e: 'update:modelValue', value: boolean): void }>();
 
 const store = useEditorStore();
-const format = ref<ExportFormat>('png');
-const background = ref('#ffffff');
-const quality = ref(92);
 
 const visible = computed({
   get: () => props.modelValue,
   set: (value: boolean) => emit('update:modelValue', value),
 });
 
-const isPng = computed(() => format.value === 'png');
+const isPng = computed(() => store.exportFormat === 'png');
 
 async function doExport(): Promise<void> {
-  await store.exportImage(format.value, background.value, quality.value / 100);
+  // 导出选项（格式/质量/铺底色）跨项目记忆，存于偏好
+  await store.exportImage(store.exportFormat, store.exportBackground, store.exportQuality / 100);
   visible.value = false;
 }
 </script>
@@ -28,7 +26,7 @@ async function doExport(): Promise<void> {
   <el-dialog v-model="visible" title="导出图片" width="460px" append-to-body>
     <el-form label-width="96px">
       <el-form-item label="格式">
-        <el-radio-group v-model="format">
+        <el-radio-group v-model="store.exportFormat">
           <el-radio-button value="png">PNG</el-radio-button>
           <el-radio-button value="jpeg">JPEG</el-radio-button>
           <el-radio-button value="webp">WebP</el-radio-button>
@@ -36,12 +34,12 @@ async function doExport(): Promise<void> {
       </el-form-item>
 
       <el-form-item v-if="!isPng" label="质量">
-        <el-slider v-model="quality" :min="50" :max="100" />
+        <ParamSlider v-model="store.exportQuality" label="编码质量" unit="%" :min="50" :max="100" />
       </el-form-item>
 
       <el-form-item v-if="!isPng" label="透明铺底">
-        <el-color-picker v-model="background" :predefine="['#ffffff', '#000000', '#808080']" />
-        <span class="hint-inline">{{ format.toUpperCase() }} 不支持透明度，透明区域将以此颜色铺底</span>
+        <el-color-picker v-model="store.exportBackground" :predefine="['#ffffff', '#000000', '#808080']" />
+        <span class="hint-inline">{{ store.exportFormat.toUpperCase() }} 不支持透明度，透明区域将以此颜色铺底</span>
       </el-form-item>
 
       <el-form-item v-else label="透明度">

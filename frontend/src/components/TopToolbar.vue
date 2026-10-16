@@ -7,6 +7,7 @@ import {
   Files,
   FolderOpened,
   FullScreen,
+  Grid,
   Hide,
   Picture,
   RefreshLeft,
@@ -32,6 +33,18 @@ const historyPosition = computed(() => {
   if (!history || !store.hasImage) return '历史';
   return `${history.pathTo(store.currentHistoryId).length}/${history.count}`;
 });
+
+/** 按住式临时查看：按下显示、松开（含拖出/失焦）恢复 */
+function startHold(kind: 'original' | 'regions', event: PointerEvent): void {
+  (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
+  if (kind === 'original') store.pressOriginal(true);
+  else store.pressRegions(true);
+}
+
+function endHold(kind: 'original' | 'regions'): void {
+  if (kind === 'original') store.pressOriginal(false);
+  else store.pressRegions(false);
+}
 </script>
 
 <template>
@@ -66,8 +79,7 @@ const historyPosition = computed(() => {
         <el-button
           :icon="Files"
           circle
-          :plain="!store.dirty"
-          :type="store.dirty ? 'primary' : 'default'"
+          :type="store.dirty ? 'danger' : 'success'"
           :disabled="!store.hasImage || store.busy"
           @click="store.saveProject()"
         />
@@ -112,21 +124,33 @@ const historyPosition = computed(() => {
     <div class="divider" />
 
     <div class="group">
-      <el-tooltip
-        :content="
-          store.showOriginal
-            ? '返回编辑结果'
-            : '查看原图（临时对比，不改变编辑状态、不产生历史节点）'
-        "
-        placement="bottom"
-      >
+      <el-tooltip content="按住查看原图，松开恢复编辑结果（不改变编辑状态、不产生历史节点）" placement="bottom">
         <el-button
           :icon="store.showOriginal ? Hide : View"
           circle
           plain
           :type="store.showOriginal ? 'primary' : 'default'"
           :disabled="!store.hasImage"
-          @click="store.showOriginal = !store.showOriginal"
+          @pointerdown="startHold('original', $event)"
+          @pointerup="endHold('original')"
+          @pointercancel="endHold('original')"
+          @lostpointercapture="endHold('original')"
+        />
+      </el-tooltip>
+      <el-tooltip
+        content="按住显示所有区域（不同区域用不同颜色，固定的更实），松开恢复编辑视图"
+        placement="bottom"
+      >
+        <el-button
+          :icon="Grid"
+          circle
+          plain
+          :type="store.showRegions ? 'primary' : 'default'"
+          :disabled="!store.hasImage || store.regions.length === 0"
+          @pointerdown="startHold('regions', $event)"
+          @pointerup="endHold('regions')"
+          @pointercancel="endHold('regions')"
+          @lostpointercapture="endHold('regions')"
         />
       </el-tooltip>
       <el-tooltip content="适应窗口 (Ctrl+0)" placement="bottom">

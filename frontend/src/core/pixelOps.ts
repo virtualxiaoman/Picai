@@ -54,6 +54,10 @@ export function applyPixelOp(
     }
     return;
   }
+  if (op.type === 'color_shift') {
+    applyColorShift(pixels, mask, op.target, strengthOf(op.strength), op.mode, op.targetStd);
+    return;
+  }
   if (op.type === 'solid') {
     const [r, g, b] = op.color;
     for (let i = 0; i < count; i++) {
@@ -131,6 +135,255 @@ export function hexToRgb(hex: string): [number, number, number] {
   if (!m) return [0, 0, 0];
   const v = parseInt(m[1], 16);
   return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
+}
+
+// ---------- 色彩靠近（Lab 均值偏移迁移） ----------
+
+function srgbToLinear(c: number): number {
+  const v = c / 255;
+  return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+}
+
+function linearToSrgb(c: number): number {
+  const v = c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+  return Math.max(0, Math.min(1, v)) * 255;
+}
+
+function labF(t: number): number {
+  return t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116;
+}
+
+function labFInv(t: number): number {
+  const t3 = t * t * t;
+  return t3 > 0.008856 ? t3 : (t - 16 / 116) / 7.787;
+}
+
+/** sRGB -> CIELAB（D65） */
+export function rgbToLab(r: number, g: number, b: number): [number, number, number] {
+  const rl = srgbToLinear(r);
+  const gl = srgbToLinear(g);
+  const bl = srgbToLinear(b);
+  const x = 0.4124564 * rl + 0.3575761 * gl + 0.1804375 * bl;
+  const y = 0.2126729 * rl + 0.7151522 * gl + 0.072175 * bl;
+  const z = 0.0193339 * rl + 0.119192 * gl + 0.9503041 * bl;
+  const fx = labF(x / 0.95047);
+  const fy = labF(y);
+  const fz = labF(z / 1.08883);
+  return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
+}
+
+/** CIELAB -> sRGB（含色域裁剪） */
+export function labToRgb(l: number, a: number, b: number): [number, number, number] {
+  const fy = (l + 16) / 116;
+  const fx = fy + a / 500;
+  const fz = fy - b / 200;
+  const x = 0.95047 * labFInv(fx);
+  const y = labFInv(fy);
+  const z = 1.08883 * labFInv(fz);
+  const rl = 3.2404542 * x - 1.5371385 * y - 0.4985314 * z;
+  const gl = -0.969266 * x + 1.8760108 * y + 0.041556 * z;
+  const bl = 0.0556434 * x - 0.2040259 * y + 1.0572252 * z;
+  return [linearToSrgb(rl), linearToSrgb(gl), linearToSrgb(bl)];
+}
+
+function strengthOf(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+/** 计算蒙版区域（按蒙版权重）的 Lab 加权均值与标准差 */
+function maskedLabStats(
+  pixels: Uint8ClampedArray,
+  mask: Uint8Array | Uint8ClampedArray,
+): { mean: [number, number, number]; std: [number, number, number]; weight: number } | null {
+  let w = 0;
+  let mL = 0;
+  let mA = 0;
+  let mB = 0;
+  let sL = 0;
+  let sA = 0;
+  let sB = 0;
+  for (let i = 0; i < mask.length; i++) {
+    const m = mask[i];
+    if (m === 0) continue;
+    const p = i * 4;
+    const lab = rgbToLab(pixels[p], pixels[p + 1], pixels[p + 2]);
+    mL += lab[0] * m;
+    mA += lab[1] * m;
+    mB += lab[2] * m;
+    sL += lab[0] * lab[0] * m;
+    sA += lab[1] * lab[1] * m;
+    sB += lab[2] * lab[2] * m;
+    w += m;
+  }
+  if (w === 0) return null;
+  const mean: [number, number, number] = [mL / w, mA / w, mB / w];
+  const std: [number, number, number] = [
+    Math.sqrt(Math.max(0, sL / w - mean[0] * mean[0])),
+    Math.sqrt(Math.max(0, sA / w - mean[1] * mean[1])),
+    Math.sqrt(Math.max(0, sB / w - mean[2] * mean[2])),
+  ];
+  return { mean, std, weight: w };
+}
+
+/** Lab -> LCh（明度、饱和度、色相弧度） */
+function labToLch(l: number, a: number, b: number): [number, number, number] {
+  return [l, Math.hypot(a, b), Math.atan2(b, a)];
+}
+
+function lchToLab(l: number, c: number, h: number): [number, number, number] {
+  return [l, c * Math.cos(h), c * Math.sin(h)];
+}
+
+/** 最短路径色相差 */
+function hueDelta(from: number, to: number): number {
+  let d = to - from;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return d;
+}
+
+/**
+ * 色彩靠近核心（三种迁移模式）：
+ * - offset：区域均值 -> 目标色的加性偏移，明暗纹理完全保留
+ * - hue：仅旋转色相（保留 L 与 C），灰度/低饱和像素不迁移
+ * - match：均值与标准差同时向目标对齐（分布匹配）
+ */
+function applyColorShift(
+  pixels: Uint8ClampedArray,
+  mask: Uint8Array | Uint8ClampedArray,
+  target: [number, number, number],
+  strength: number,
+  mode: 'offset' | 'hue' | 'match',
+  targetStd?: [number, number, number],
+): void {
+  const s = strength;
+  if (s === 0) return;
+  const stats = maskedLabStats(pixels, mask);
+  if (!stats) return;
+  const mean1 = stats.mean;
+  const std1 = stats.std;
+  const tgt = rgbToLab(target[0], target[1], target[2]);
+  const count = mask.length;
+
+  if (mode === 'hue') {
+    const mean1Lch = labToLch(mean1[0], mean1[1], mean1[2]);
+    const tgtLch = labToLch(tgt[0], tgt[1], tgt[2]);
+    const deltaH = hueDelta(mean1Lch[2], tgtLch[2]) * s;
+    if (deltaH === 0) return;
+    for (let i = 0; i < count; i++) {
+      const m = mask[i];
+      if (m === 0) continue;
+      const p = i * 4;
+      const lab = rgbToLab(pixels[p], pixels[p + 1], pixels[p + 2]);
+      const lch = labToLch(lab[0], lab[1], lab[2]);
+      if (lch[1] <= 2) continue; // 近灰色像素无有意义色相，保持不变
+      const shifted = labToRgb(...lchToLab(lch[0], lch[1], lch[2] + deltaH));
+      const w = m / 255;
+      pixels[p] = pixels[p] + (shifted[0] - pixels[p]) * w;
+      pixels[p + 1] = pixels[p + 1] + (shifted[1] - pixels[p + 1]) * w;
+      pixels[p + 2] = pixels[p + 2] + (shifted[2] - pixels[p + 2]) * w;
+    }
+    return;
+  }
+
+  if (mode === 'match') {
+    const stdT = targetStd ?? [0, 0, 0];
+    const K: [number, number, number] = [0, 0, 0];
+    const M: [number, number, number] = [0, 0, 0];
+    for (let ch = 0; ch < 3; ch++) {
+      // stdT 为 0（点色/手动色目标）时 scale 为 0：强度拉满即靠向纯色；
+      // 上限 5 防止应用区域本身接近均匀时对比度被放大过度
+      const base = Math.max(std1[ch], 1e-3);
+      const scale = Math.min(5, Math.max(0, stdT[ch] / base));
+      K[ch] = 1 + (scale - 1) * s;
+      M[ch] = mean1[ch] + (tgt[ch] - mean1[ch]) * s;
+    }
+    for (let i = 0; i < count; i++) {
+      const m = mask[i];
+      if (m === 0) continue;
+      const p = i * 4;
+      const lab = rgbToLab(pixels[p], pixels[p + 1], pixels[p + 2]);
+      const nl = Math.min(100, Math.max(0, (lab[0] - mean1[0]) * K[0] + M[0]));
+      const na = Math.min(127, Math.max(-128, (lab[1] - mean1[1]) * K[1] + M[1]));
+      const nb = Math.min(127, Math.max(-128, (lab[2] - mean1[2]) * K[2] + M[2]));
+      const shifted = labToRgb(nl, na, nb);
+      const w = m / 255;
+      pixels[p] = pixels[p] + (shifted[0] - pixels[p]) * w;
+      pixels[p + 1] = pixels[p + 1] + (shifted[1] - pixels[p + 1]) * w;
+      pixels[p + 2] = pixels[p + 2] + (shifted[2] - pixels[p + 2]) * w;
+    }
+    return;
+  }
+
+  // offset：加性偏移（默认）
+  const dL = (tgt[0] - mean1[0]) * s;
+  const da = (tgt[1] - mean1[1]) * s;
+  const db = (tgt[2] - mean1[2]) * s;
+  if (dL === 0 && da === 0 && db === 0) return;
+  for (let i = 0; i < count; i++) {
+    const m = mask[i];
+    if (m === 0) continue;
+    const p = i * 4;
+    const lab = rgbToLab(pixels[p], pixels[p + 1], pixels[p + 2]);
+    const nl = Math.min(100, Math.max(0, lab[0] + dL));
+    const shifted = labToRgb(nl, lab[1] + da, lab[2] + db);
+    const w = m / 255;
+    pixels[p] = pixels[p] + (shifted[0] - pixels[p]) * w;
+    pixels[p + 1] = pixels[p + 1] + (shifted[1] - pixels[p + 1]) * w;
+    pixels[p + 2] = pixels[p + 2] + (shifted[2] - pixels[p + 2]) * w;
+  }
+}
+
+/** 蒙版区域加权平均色（RGB，无像素时返回 null） */
+export function maskedMeanColor(
+  pixels: Uint8ClampedArray,
+  gray: Uint8Array | Uint8ClampedArray,
+): [number, number, number] | null {
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  let w = 0;
+  for (let i = 0; i < gray.length; i++) {
+    const m = gray[i];
+    if (m === 0) continue;
+    const p = i * 4;
+    r += pixels[p] * m;
+    g += pixels[p + 1] * m;
+    b += pixels[p + 2] * m;
+    w += m;
+  }
+  if (w === 0) return null;
+  return [r / w, g / w, b / w];
+}
+
+/**
+ * 蒙版区域众数色：按 RGB 高 4 位量化到 16³ 色块，取权重最大的色块，
+ * 返回该色块内像素的加权均值。
+ */
+export function maskedModeColor(
+  pixels: Uint8ClampedArray,
+  gray: Uint8Array | Uint8ClampedArray,
+): [number, number, number] | null {
+  const counts = new Float64Array(4096);
+  const sumR = new Float64Array(4096);
+  const sumG = new Float64Array(4096);
+  const sumB = new Float64Array(4096);
+  for (let i = 0; i < gray.length; i++) {
+    const m = gray[i];
+    if (m === 0) continue;
+    const p = i * 4;
+    const bin = ((pixels[p] >> 4) << 8) | ((pixels[p + 1] >> 4) << 4) | (pixels[p + 2] >> 4);
+    counts[bin] += m;
+    sumR[bin] += pixels[p] * m;
+    sumG[bin] += pixels[p + 1] * m;
+    sumB[bin] += pixels[p + 2] * m;
+  }
+  let best = -1;
+  for (let bin = 0; bin < 4096; bin++) {
+    if (counts[bin] > 0 && (best === -1 || counts[bin] > counts[best])) best = bin;
+  }
+  if (best === -1) return null;
+  return [sumR[best] / counts[best], sumG[best] / counts[best], sumB[best] / counts[best]];
 }
 
 // ---------- 蒙版后处理 ----------

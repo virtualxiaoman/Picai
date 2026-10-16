@@ -17,13 +17,13 @@ const tools: ToolDef[] = [
   {
     id: 'brush-circle',
     label: '圆形画笔',
-    tooltip: '圆形画笔：涂抹增加选区，按住 Alt 临时减去',
+    tooltip: '圆形画笔：涂抹增加选区；Ctrl/Shift 加选、Alt 减选',
     svg: '<circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="12" cy="12" r="2.4" fill="currentColor"/>',
   },
   {
     id: 'brush-square',
     label: '方形画笔',
-    tooltip: '方形画笔：涂抹增加选区，按住 Alt 临时减去',
+    tooltip: '方形画笔：涂抹增加选区；Ctrl/Shift 加选、Alt 减选',
     svg: '<rect x="4.5" y="4.5" width="15" height="15" rx="1" fill="none" stroke="currentColor" stroke-width="1.8"/><rect x="10" y="10" width="4" height="4" fill="currentColor"/>',
   },
   {
