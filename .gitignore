@@ -18,6 +18,9 @@ models/*
 test-assets/*.png
 test-assets/*.jpg
 
+# 项目历史数据（磁盘存储，随用户数据，不纳入版本控制）
+data/
+
 # IDE
 .idea/
 .vscode/

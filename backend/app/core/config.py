@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     # 后台任务超时（秒）
     task_timeout_seconds: float = 600.0
 
+    # 项目历史数据磁盘存储根目录（每个项目一个子文件夹）
+    storage_root: Path = PROJECT_ROOT / "data" / "history"
+
     @property
     def frontend_dist(self) -> Path:
         return PROJECT_ROOT / "frontend" / "dist"

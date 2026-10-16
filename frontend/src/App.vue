@@ -90,8 +90,8 @@ onMounted(() => {
   window.addEventListener('dragover', preventWindowDrop);
   window.addEventListener('drop', preventWindowDrop);
   window.addEventListener('beforeunload', onBeforeUnload);
-  // 启动时自动恢复上次保存的项目（刷新 / 重启后仍可恢复）
-  void store.tryRestoreProject();
+  // 启动：先尝试迁移浏览器旧存储到 data/history，再自动恢复最近打开的项目
+  void store.initializeStorage();
 });
 
 onBeforeUnmount(() => {

@@ -1,31 +1,26 @@
 /**
- * 项目持久化（IndexedDB，多项目 schema）：
- * - projects：项目元数据
- * - images：项目内图片（原图 Blob、当前版本、缩略图）
- * - nodes：每张图片的历史树节点（快照 Blob）
- * - regions：每张图片的保存区域（灰度蒙版 Blob）
- * - app_state：最近打开的项目/图片（用于启动恢复）
+ * 项目持久化（磁盘文件存储，经后端 /api/storage）。
  *
- * 所有 Blob 直接以结构化克隆存储，无 Base64 转换。
- * 数据库从 v1（单项目）自动迁移到 v3（多项目）。
+ * 目录结构（项目根/data/history/）：
+ *   app_state.json                    最近打开的项目/图片（服务端随保存自动维护）
+ *   <项目名>/                          每个项目一个文件夹（重命名时后端自动改文件夹名）
+ *       project.json                   项目清单（图片 / 历史节点 / 区域元数据 + Blob 文件名）
+ *       blobs/                         原图、历史快照、缩略图、区域蒙版（二进制）
+ *
+ * Blob 采用确定性命名（见 blobName），保存时只上传"服务端还没有的"文件；
+ * 清单全量提交，服务端按清单自动清理未引用的 Blob。
+ * 历史快照较大，加载时按需（撤销/预览时）再拉取，缩略图直接用 URL 展示。
  */
 
-import type { HistoryOp, HistoryNode } from './HistoryManager';
-
-const DB_NAME = 'picai';
-const DB_VERSION = 3;
-
-const STORE_PROJECTS = 'projects';
-const STORE_IMAGES = 'images';
-const STORE_NODES = 'nodes';
-const STORE_REGIONS = 'regions';
-const STORE_APP_STATE = 'app_state';
+import type { HistoryNode, HistoryOp } from './HistoryManager';
 
 export interface ProjectRow {
   id: string;
+  folder: string;
   name: string;
   createdAt: number;
   updatedAt: number;
+  imageCount: number;
 }
 
 export interface ImageRow {
@@ -34,292 +29,255 @@ export interface ImageRow {
   name: string;
   width: number;
   height: number;
-  originalBlob: Blob;
-  thumbBlob: Blob | null;
   currentHistoryId: number;
   originNote: string;
   createdAt: number;
+  originalUrl: string;
+  thumbUrl: string | null;
 }
 
-export interface NodeRow {
-  dbKey: string;
-  imageId: string;
+export interface ManifestNode {
   id: number;
   parentId: number | null;
   childIds: number[];
   op: HistoryOp;
   time: number;
   label: string;
-  imageBlob: Blob | null;
-  thumbBlob: Blob | null;
+  regionIds: string[];
+  snapshot: string;
+  thumb: string | null;
+}
+
+export interface ManifestRegion {
+  id: string;
+  name: string;
+  locked: boolean;
+  order: number;
+  gray: string;
+  thumb: string | null;
+}
+
+export interface ManifestImage {
+  id: string;
+  name: string;
+  width: number;
+  height: number;
+  currentHistoryId: number;
+  originNote: string;
+  createdAt: number;
+  original: string;
+  thumb: string | null;
+  nodes: ManifestNode[];
+  regions: ManifestRegion[];
+}
+
+export interface ProjectManifest {
+  id: string;
+  name: string;
+  createdAt: number;
+  updatedAt: number;
+  activeImageId: string | null;
+  images: ManifestImage[];
 }
 
 export interface RegionRow {
   id: string;
-  imageId: string;
   name: string;
   locked: boolean;
   order: number;
+  grayUrl: string;
+  thumbUrl: string | null;
   grayBlob: Blob;
-  thumbBlob: Blob | null;
 }
 
-export interface AppStateRow {
-  key: 'active';
+export interface OpenedProject {
+  project: ProjectRow;
+  images: ImageRow[];
+  nodesOf(imageId: string): HistoryNode[];
+  regionsOf(imageId: string): Promise<RegionRow[]>;
+  /** 清单已引用的全部 Blob 文件名（保存时据此判断哪些需要上传） */
+  blobNames: Set<string>;
+}
+
+export interface StoredAppState {
   projectId: string | null;
+  folder: string | null;
   imageId: string | null;
-  updatedAt: number;
 }
 
-function ensureStores(db: IDBDatabase): void {
-  if (!db.objectStoreNames.contains(STORE_PROJECTS)) {
-    db.createObjectStore(STORE_PROJECTS, { keyPath: 'id' });
-  }
-  if (!db.objectStoreNames.contains(STORE_IMAGES)) {
-    db.createObjectStore(STORE_IMAGES, { keyPath: 'id' }).createIndex('projectId', 'projectId');
-  }
-  if (!db.objectStoreNames.contains(STORE_NODES)) {
-    db.createObjectStore(STORE_NODES, { keyPath: 'dbKey' }).createIndex('imageId', 'imageId');
-  }
-  if (!db.objectStoreNames.contains(STORE_REGIONS)) {
-    db.createObjectStore(STORE_REGIONS, { keyPath: 'id' }).createIndex('imageId', 'imageId');
-  }
-  if (!db.objectStoreNames.contains(STORE_APP_STATE)) {
-    db.createObjectStore(STORE_APP_STATE, { keyPath: 'key' });
-  }
-}
+/** 确定性 Blob 文件名 */
+export const blobName = {
+  original: (imageId: string) => `${imageId}.original`,
+  imageThumb: (imageId: string) => `${imageId}.thumb`,
+  snapshot: (imageId: string, nodeId: number) => `${imageId}.n${nodeId}.snapshot`,
+  nodeThumb: (imageId: string, nodeId: number) => `${imageId}.n${nodeId}.thumb`,
+  regionGray: (regionId: string) => `${regionId}.gray`,
+  regionThumb: (regionId: string) => `${regionId}.thumb`,
+};
 
-/** 旧版（v1）单项目数据迁移到多项目 schema */
-function migrateV1(db: IDBDatabase, tx: IDBTransaction, done: () => void): void {
-  const hasOldProject = db.objectStoreNames.contains('project');
-  const hasOldNodes = db.objectStoreNames.contains('nodes');
-  let oldProject: Record<string, unknown> | null = null;
-  let oldNodes: Record<string, unknown>[] = [];
-  let pending = (hasOldProject ? 1 : 0) + (hasOldNodes ? 1 : 0);
-
-  const finish = (): void => {
-    // 'nodes' 名称被新 schema 复用：先删旧 store 再重建
-    if (hasOldProject) db.deleteObjectStore('project');
-    if (hasOldNodes) db.deleteObjectStore('nodes');
-    ensureStores(db);
-    if (oldProject && oldNodes.length > 0) {
-      const ts = Date.now();
-      const projectId = `p-legacy-${ts}`;
-      const imageId = `img-legacy-${ts}`;
-      const root = oldNodes.find((n) => n.parentId == null) ?? oldNodes[0];
-      tx.objectStore(STORE_PROJECTS).put({
-        id: projectId,
-        name: '我的项目',
-        createdAt: (oldProject.createdAt as number) ?? ts,
-        updatedAt: (oldProject.updatedAt as number) ?? ts,
-      } satisfies ProjectRow);
-      tx.objectStore(STORE_IMAGES).put({
-        id: imageId,
-        projectId,
-        name: (oldProject.sourceName as string) ?? 'image',
-        width: (oldProject.imageWidth as number) ?? 0,
-        height: (oldProject.imageHeight as number) ?? 0,
-        originalBlob: root.imageBlob as Blob,
-        thumbBlob: (root.thumbBlob as Blob | null) ?? null,
-        currentHistoryId: (oldProject.currentHistoryId as number) ?? (root.id as number),
-        originNote: '（由旧版数据迁移）',
-        createdAt: (oldProject.createdAt as number) ?? ts,
-      } satisfies ImageRow);
-      for (const node of oldNodes) {
-        tx.objectStore(STORE_NODES).put({
-          dbKey: `${imageId}:${node.id}`,
-          imageId,
-          id: node.id,
-          parentId: node.parentId,
-          childIds: node.childIds,
-          op: node.op,
-          time: node.time,
-          label: node.label,
-          imageBlob: node.imageBlob,
-          thumbBlob: node.thumbBlob,
-        });
-      }
-      tx.objectStore(STORE_APP_STATE).put({
-        key: 'active',
-        projectId,
-        imageId,
-        updatedAt: ts,
-      } satisfies AppStateRow);
+async function toJson<T>(res: Response): Promise<T> {
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const data = (await res.json()) as { detail?: string };
+      if (data.detail) detail = data.detail;
+    } catch {
+      /* 非 JSON 响应 */
     }
-    done();
-  };
-
-  if (pending === 0) {
-    finish();
-    return;
+    throw new Error(detail);
   }
-  if (hasOldProject) {
-    const req = tx.objectStore('project').get('current');
-    req.onsuccess = () => {
-      oldProject = (req.result as Record<string, unknown> | undefined) ?? null;
-      pending--;
-      if (pending === 0) finish();
-    };
-    req.onerror = () => {
-      pending--;
-      if (pending === 0) finish();
-    };
-  }
-  if (hasOldNodes) {
-    const req = tx.objectStore('nodes').getAll();
-    req.onsuccess = () => {
-      oldNodes = (req.result as Record<string, unknown>[]) ?? [];
-      pending--;
-      if (pending === 0) finish();
-    };
-    req.onerror = () => {
-      oldNodes = [];
-      pending--;
-      if (pending === 0) finish();
-    };
-  }
-}
-
-function openDb(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = (event) => {
-      const db = req.result;
-      const tx = req.transaction!;
-      const oldVersion = event.oldVersion;
-      if (oldVersion === 1) {
-        migrateV1(db, tx, () => ensureStores(db));
-      } else {
-        ensureStores(db);
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error ?? new Error('无法打开 IndexedDB'));
-  });
-}
-
-function requestToPromise<T>(req: IDBRequest<T>): Promise<T> {
-  return new Promise((resolve, reject) => {
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error ?? new Error('IndexedDB 请求失败'));
-  });
+  return (await res.json()) as T;
 }
 
 export class ProjectStorage {
-  private dbPromise: Promise<IDBDatabase> | null = null;
-
-  private db(): Promise<IDBDatabase> {
-    if (!this.dbPromise) this.dbPromise = openDb();
-    return this.dbPromise;
-  }
-
   async listProjects(): Promise<ProjectRow[]> {
-    const db = await this.db();
-    const rows = await requestToPromise<ProjectRow[]>(
-      db.transaction(STORE_PROJECTS).objectStore(STORE_PROJECTS).getAll(),
+    const data = await toJson<{ projects: ProjectRow[] }>(
+      await fetch('/api/storage/projects'),
     );
-    return rows.sort((a, b) => b.updatedAt - a.updatedAt);
+    return data.projects;
   }
 
-  async listImages(projectId: string): Promise<ImageRow[]> {
-    const db = await this.db();
-    const rows = await requestToPromise<ImageRow[]>(
-      db.transaction(STORE_IMAGES).objectStore(STORE_IMAGES).index('projectId').getAll(projectId),
-    );
-    return rows.sort((a, b) => a.createdAt - b.createdAt);
+  blobUrl(folder: string, name: string): string {
+    return `/api/storage/projects/${encodeURIComponent(folder)}/blobs/${encodeURIComponent(name)}`;
   }
 
-  /** 载入某张图片的全部历史节点（含快照 Blob） */
-  async loadNodes(imageId: string): Promise<HistoryNode[]> {
-    const db = await this.db();
-    const rows = await requestToPromise<NodeRow[]>(
-      db.transaction(STORE_NODES).objectStore(STORE_NODES).index('imageId').getAll(imageId),
-    );
-    return rows
-      .sort((a, b) => a.id - b.id)
-      .map((row) => ({
-        id: row.id,
-        parentId: row.parentId,
-        childIds: [...row.childIds],
-        op: row.op,
-        time: row.time,
-        label: row.label,
-        imageBlob: row.imageBlob,
-        thumbBlob: row.thumbBlob,
-      }));
+  async fetchBlob(url: string): Promise<Blob> {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`读取文件失败：HTTP ${res.status}`);
+    return res.blob();
   }
 
-  async loadRegions(imageId: string): Promise<RegionRow[]> {
-    const db = await this.db();
-    const rows = await requestToPromise<RegionRow[]>(
-      db.transaction(STORE_REGIONS).objectStore(STORE_REGIONS).index('imageId').getAll(imageId),
+  /** 打开项目：返回图片行、按需的历史节点（含快照 URL）与区域（灰度按需拉取） */
+  async openProject(folder: string): Promise<OpenedProject> {
+    const data = await toJson<{ manifest: ProjectManifest }>(
+      await fetch(`/api/storage/projects/${encodeURIComponent(folder)}`),
     );
-    return rows.sort((a, b) => a.order - b.order);
-  }
-
-  /** 保存整个项目：项目行、图片行、历史节点、区域与最近打开状态 */
-  async saveAll(params: {
-    project: ProjectRow;
-    images: ImageRow[];
-    nodes: NodeRow[];
-    regions: RegionRow[];
-    activeImageId: string | null;
-  }): Promise<void> {
-    const db = await this.db();
-    await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(
-        [STORE_PROJECTS, STORE_IMAGES, STORE_NODES, STORE_REGIONS, STORE_APP_STATE],
-        'readwrite',
+    const manifest = data.manifest;
+    const project: ProjectRow = {
+      id: manifest.id,
+      folder,
+      name: manifest.name,
+      createdAt: manifest.createdAt,
+      updatedAt: manifest.updatedAt,
+      imageCount: manifest.images.length,
+    };
+    const images: ImageRow[] = manifest.images.map((m) => ({
+      id: m.id,
+      projectId: manifest.id,
+      name: m.name,
+      width: m.width,
+      height: m.height,
+      currentHistoryId: m.currentHistoryId,
+      originNote: m.originNote,
+      createdAt: m.createdAt,
+      originalUrl: this.blobUrl(folder, m.original),
+      thumbUrl: m.thumb ? this.blobUrl(folder, m.thumb) : null,
+    }));
+    const nodesByImage = new Map<string, HistoryNode[]>();
+    const regionsByImage = new Map<string, ManifestRegion[]>();
+    const blobNames = new Set<string>();
+    for (const m of manifest.images) {
+      nodesByImage.set(
+        m.id,
+        m.nodes.map((n) => ({
+          id: n.id,
+          parentId: n.parentId,
+          childIds: [...n.childIds],
+          op: n.op,
+          time: n.time,
+          label: n.label,
+          regionIds: Array.isArray(n.regionIds) ? [...n.regionIds] : undefined,
+          imageBlob: null,
+          thumbBlob: null,
+          snapshotUrl: this.blobUrl(folder, n.snapshot),
+          thumbUrl: n.thumb ? this.blobUrl(folder, n.thumb) : null,
+        })),
       );
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error ?? new Error('项目写入失败'));
-      tx.onabort = () => reject(tx.error ?? new Error('项目写入中止'));
-      tx.objectStore(STORE_PROJECTS).put(params.project);
-      const imageStore = tx.objectStore(STORE_IMAGES);
-      for (const image of params.images) imageStore.put(image);
-      const nodeStore = tx.objectStore(STORE_NODES);
-      for (const node of params.nodes) nodeStore.put(node);
-      const regionStore = tx.objectStore(STORE_REGIONS);
-      for (const region of params.regions) regionStore.put(region);
-      tx.objectStore(STORE_APP_STATE).put({
-        key: 'active',
-        projectId: params.project.id,
-        imageId: params.activeImageId,
-        updatedAt: Date.now(),
-      } satisfies AppStateRow);
-    });
-  }
-
-  async loadAppState(): Promise<AppStateRow | null> {
-    const db = await this.db();
-    const row = await requestToPromise<AppStateRow | undefined>(
-      db.transaction(STORE_APP_STATE).objectStore(STORE_APP_STATE).get('active'),
-    );
-    return row ?? null;
-  }
-
-  /** 关闭数据库连接（测试与退出清理用） */
-  async close(): Promise<void> {
-    if (!this.dbPromise) return;
-    try {
-      const db = await this.dbPromise;
-      db.close();
-    } catch {
-      /* 打开失败时无需关闭 */
-    }
-    this.dbPromise = null;
-  }
-
-  async usage(): Promise<{ usage: number; quota: number } | null> {
-    try {
-      if (navigator.storage?.estimate) {
-        const est = await navigator.storage.estimate();
-        return { usage: est.usage ?? 0, quota: est.quota ?? 0 };
+      regionsByImage.set(m.id, m.regions ?? []);
+      blobNames.add(m.original);
+      if (m.thumb) blobNames.add(m.thumb);
+      for (const n of m.nodes) {
+        blobNames.add(n.snapshot);
+        if (n.thumb) blobNames.add(n.thumb);
       }
-    } catch {
-      /* 不支持时静默 */
+      for (const r of m.regions ?? []) {
+        blobNames.add(r.gray);
+        if (r.thumb) blobNames.add(r.thumb);
+      }
     }
-    return null;
+    return {
+      project,
+      images,
+      nodesOf: (imageId: string) => nodesByImage.get(imageId) ?? [],
+      regionsOf: async (imageId: string) => {
+        const list = regionsByImage.get(imageId) ?? [];
+        const rows: RegionRow[] = [];
+        for (const r of list) {
+          const grayUrl = this.blobUrl(folder, r.gray);
+          rows.push({
+            id: r.id,
+            name: r.name,
+            locked: r.locked,
+            order: r.order,
+            grayUrl,
+            thumbUrl: r.thumb ? this.blobUrl(folder, r.thumb) : null,
+            grayBlob: await this.fetchBlob(grayUrl),
+          });
+        }
+        return rows.sort((a, b) => a.order - b.order);
+      },
+      blobNames,
+    };
+  }
+
+  /** 保存项目清单 + 新增 Blob；folder 为空时服务端按项目名新建文件夹 */
+  async saveProject(
+    folder: string | null,
+    manifest: ProjectManifest,
+    files: File[],
+  ): Promise<{ folder: string }> {
+    const form = new FormData();
+    if (folder) form.append('folder', folder);
+    form.append('manifest', JSON.stringify(manifest));
+    for (const file of files) form.append('files', file, file.name);
+    return toJson<{ folder: string }>(
+      await fetch('/api/storage/save', { method: 'POST', body: form }),
+    );
+  }
+
+  /** 仅上传 Blob（迁移时分批上传，不动清单） */
+  async uploadBlobs(folder: string, files: File[]): Promise<void> {
+    const form = new FormData();
+    for (const file of files) form.append('files', file, file.name);
+    await toJson<{ uploaded: number }>(
+      await fetch(`/api/storage/projects/${encodeURIComponent(folder)}/blobs`, {
+        method: 'POST',
+        body: form,
+      }),
+    );
+  }
+
+  async loadAppState(): Promise<StoredAppState | null> {
+    const data = await toJson<{
+      state: { projectId?: string | null; folder?: string | null; imageId?: string | null } | null;
+    }>(await fetch('/api/storage/app-state'));
+    const state = data.state;
+    if (!state) return null;
+    return {
+      projectId: state.projectId ?? null,
+      folder: state.folder ?? null,
+      imageId: state.imageId ?? null,
+    };
+  }
+
+  async usage(): Promise<{ bytes: number; files: number; projects: number } | null> {
+    try {
+      return await toJson<{ bytes: number; files: number; projects: number }>(
+        await fetch('/api/storage/usage'),
+      );
+    } catch {
+      return null;
+    }
   }
 }
 

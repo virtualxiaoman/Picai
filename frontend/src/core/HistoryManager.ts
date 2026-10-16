@@ -16,11 +16,20 @@ export interface HistoryNode {
   childIds: number[];
   op: HistoryOp;
   time: number;
-  /** 全分辨率结果图快照（PNG Blob）；根节点为原图 */
+  /** 全分辨率结果图快照（PNG Blob）；根节点为原图。磁盘存储加载的节点此字段为 null（见 snapshotUrl） */
   imageBlob: Blob | null;
-  /** 历史面板缩略图 */
+  /** 历史面板缩略图（本地新建的节点携带；磁盘加载的见 thumbUrl） */
   thumbBlob: Blob | null;
+  /** 磁盘存储：快照文件 URL（撤销/预览时按需拉取并缓存回 imageBlob） */
+  snapshotUrl?: string | null;
+  /** 磁盘存储：缩略图 URL（可直接用于 <img> 展示） */
+  thumbUrl?: string | null;
   label: string;
+  /**
+   * 该历史版本上的区域 id 集合（区域对象按图片共享存储，节点只记成员关系）。
+   * 撤销/恢复历史版本时，区域列表随版本切换；旧数据可能为 undefined（按空处理）。
+   */
+  regionIds?: string[];
 }
 
 export class HistoryManager {
@@ -39,6 +48,7 @@ export class HistoryManager {
       imageBlob,
       thumbBlob,
       label,
+      regionIds: [],
     };
     this.nodes.set(node.id, node);
     this.currentId = node.id;
@@ -85,6 +95,8 @@ export class HistoryManager {
       imageBlob,
       thumbBlob,
       label: label ?? defaultLabel(op),
+      // 新版本继承父版本的区域集合（之后各自独立演化）
+      regionIds: [...(parent.regionIds ?? [])],
     };
     this.nodes.set(node.id, node);
     parent.childIds.push(node.id);
@@ -162,6 +174,7 @@ function defaultLabel(op: HistoryOp): string {
     gradient: '渐变替换',
     neighborhood_fill: '邻域渐变填充',
     insert_image: '插入图片',
+    color_shift: '色彩靠近',
     import: '原图',
   };
   return map[op.type] ?? op.type;

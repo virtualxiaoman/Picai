@@ -4,7 +4,7 @@
  */
 
 import { defineStore } from 'pinia';
-import { computed, markRaw, ref, shallowRef } from 'vue';
+import { computed, markRaw, ref, shallowRef, watch } from 'vue';
 import { ElMessage } from 'element-plus';
 
 import { Viewport } from '../core/viewport';
@@ -14,14 +14,27 @@ import { MaskRenderer } from '../core/MaskRenderer';
 import { EditOperations } from '../core/EditOperations';
 import { buildExportFilename, downloadBlob, encodeCanvas } from '../core/ExportService';
 import { canvasToBlob, grayMaskToPngBlob, grayToThumbBlob, makeThumbnail } from '../core/imageUtils';
-import { hexToRgb } from '../core/pixelOps';
+import { grayToRgba, hexToRgb, maskedMeanColor, maskedModeColor, rgbToLab } from '../core/pixelOps';
 import {
+  blobName,
   projectStorage,
   type ImageRow,
-  type NodeRow,
+  type ManifestImage,
+  type ManifestNode,
+  type ManifestRegion,
+  type OpenedProject,
+  type ProjectManifest,
   type ProjectRow,
-  type RegionRow,
 } from '../core/ProjectStorage';
+import { LegacyIndexedDbStorage } from '../core/legacyIndexedDb';
+import {
+  loadPrefs,
+  readPrefBool,
+  readPrefNumber,
+  readPrefRange,
+  readPrefString,
+  savePrefs,
+} from '../core/prefs';
 import {
   cancelTask,
   fetchTaskResult,
@@ -32,7 +45,14 @@ import {
   requestTextSegment,
   type TaskState,
 } from '../api/client';
-import type { CombineMode, ExportFormat, MaskOpKind, PixelOp, ToolId } from '../types';
+import type {
+  ColorShiftMode,
+  CombineMode,
+  ExportFormat,
+  MaskOpKind,
+  PixelOp,
+  ToolId,
+} from '../types';
 
 export const MAX_CANVAS_DIM = 16384;
 const MAX_CACHED_SESSIONS = 3;
@@ -58,6 +78,8 @@ export interface Region {
   /** 全分辨率灰度蒙版（0-255） */
   gray: Uint8ClampedArray;
   thumbBlob: Blob | null;
+  /** 磁盘存储：区域缩略图 URL（可直接用于 <img> 展示） */
+  thumbUrl?: string | null;
 }
 
 /** 项目内的图片（元数据 + 惰性运行时状态） */
@@ -68,12 +90,20 @@ export interface ProjectImage {
   height: number;
   createdAt: number;
   originNote: string;
-  originalBlob: Blob;
+  /** 原图数据：本地新导入时携带 Blob；磁盘加载的图片按需从 originalUrl 拉取 */
+  originalBlob: Blob | null;
+  originalUrl: string | null;
   thumbBlob: Blob | null;
+  thumbUrl: string | null;
   /** 当前历史节点 id（未载入时来自存储） */
   currentId: number;
   history: HistoryManager | null;
-  regions: Region[] | null;
+  /**
+   * 该图片的全部区域对象（注册表，共享引用）。
+   * 每个历史节点通过 regionIds 记录自己包含哪些区域，撤销/跳转版本时区域列表随版本切换；
+   * 区域对象本身不被修改（锁定状态除外），因此多版本共享不增加存储与内存开销。
+   */
+  regionRegistry: Region[] | null;
 }
 
 /** 插入图片（画布合成）状态 */
@@ -121,6 +151,10 @@ export const useEditorStore = defineStore('editor', () => {
   let editedCanvas: HTMLCanvasElement | null = null;
   let editedCtx: CanvasRenderingContext2D | null = null;
   const sessionCache = new Map<string, SessionObjects>();
+  /** 当前项目在磁盘上的打开态（清单缓存：节点/区域按需取用） */
+  let openedProject: OpenedProject | null = null;
+  /** 服务端已存在的 Blob 文件名（保存时只上传缺的部分） */
+  let serverBlobNames = new Set<string>();
 
   // ---------- 视口 ----------
   const viewport = markRaw(new Viewport());
@@ -171,24 +205,146 @@ export const useEditorStore = defineStore('editor', () => {
   const insertState = shallowRef<InsertState | null>(null);
   const insertScale = ref(1);
 
-  // ---------- 工具 ----------
-  const activeTool = ref<ToolId>('brush-circle');
-  const brushSize = ref(64);
-  const brushHardness = ref(90);
-  const brushMode = ref<CombineMode>('add');
-  const marqueeMode = ref<CombineMode>('new');
-  const fillColor = ref('#ff5a1f');
+  // ---------- 工具（参数默认值跨项目记忆，存于 localStorage 偏好） ----------
+  const prefs = loadPrefs();
+  const combineModes = ['new', 'add', 'subtract', 'intersect'];
+  const toolIds: ToolId[] = [
+    'brush-circle',
+    'brush-square',
+    'marquee-rect',
+    'marquee-ellipse',
+    'ai-remove-bg',
+    'ai-object',
+    'ai-point',
+    'magic-wand',
+  ];
+
+  const activeTool = ref<ToolId>(
+    readPrefString(prefs, 'activeTool', 'brush-circle', toolIds) as ToolId,
+  );
+  const brushSize = ref(readPrefNumber(prefs, 'brushSize', 64, 1, 1000));
+  const brushHardness = ref(readPrefNumber(prefs, 'brushHardness', 90, 0, 100));
+  const brushMode = ref<CombineMode>(
+    readPrefString(prefs, 'brushMode', 'add', combineModes) as CombineMode,
+  );
+  const marqueeMode = ref<CombineMode>(
+    readPrefString(prefs, 'marqueeMode', 'new', combineModes) as CombineMode,
+  );
+  const fillColor = ref(readPrefString(prefs, 'fillColor', '#ff5a1f'));
   const showOriginal = ref(false);
 
-  const wandTolerance = ref(32);
-  const wandContiguous = ref(true);
-  const featherRadius = ref(8);
-  const morphRadius = ref(8);
-  const gradientColor1 = ref('#000000');
-  const gradientColor2 = ref('#ffffff');
-  const gradientAngle = ref(90);
-  const gradientRange = ref<[number, number]>([0, 100]);
-  const inpaintRadius = ref(8);
+  const wandTolerance = ref(readPrefNumber(prefs, 'wandTolerance', 32, 0, 255));
+  const wandContiguous = ref(readPrefBool(prefs, 'wandContiguous', true));
+  const featherRadius = ref(readPrefNumber(prefs, 'featherRadius', 8, 1, 100));
+  const morphRadius = ref(readPrefNumber(prefs, 'morphRadius', 8, 1, 100));
+  const gradientColor1 = ref(readPrefString(prefs, 'gradientColor1', '#000000'));
+  const gradientColor2 = ref(readPrefString(prefs, 'gradientColor2', '#ffffff'));
+  const gradientAngle = ref(readPrefNumber(prefs, 'gradientAngle', 90, 0, 360));
+  const gradientRange = ref<[number, number]>(readPrefRange(prefs, 'gradientRange', [0, 100]));
+  const inpaintRadius = ref(readPrefNumber(prefs, 'inpaintRadius', 8, 1, 50));
+
+  // 导出选项（跨项目记忆）
+  const exportFormat = ref<ExportFormat>(
+    readPrefString(prefs, 'exportFormat', 'png', ['png', 'jpeg', 'webp']) as ExportFormat,
+  );
+  const exportQuality = ref(readPrefNumber(prefs, 'exportQuality', 92, 50, 100));
+  const exportBackground = ref(readPrefString(prefs, 'exportBackground', '#ffffff'));
+
+  // 选区显示模式（跨项目记忆）：半透明填色 / 差分（反相，底色相近时也清晰可辨）
+  const maskDisplayMode = ref<'fill' | 'difference'>(
+    readPrefString(prefs, 'maskDisplayMode', 'fill', ['fill', 'difference']) as
+      | 'fill'
+      | 'difference',
+  );
+
+  // 色彩靠近（向目标色迁移；参数默认值跨项目记忆，区域 id / 取色点不记忆）
+  /** 应用对象（被改变的区域）：null = 当前选区，否则为已保存区域 id */
+  const shiftApplyToRegionId = ref<string | null>(null);
+  const shiftTargetSource = ref<'selection' | 'pick' | 'manual'>(
+    readPrefString(prefs, 'shiftTargetSource', 'selection', ['selection', 'pick', 'manual']) as
+      | 'selection'
+      | 'pick'
+      | 'manual',
+  );
+  /** 目标区域：null = 当前选区，否则为已保存区域 id */
+  const shiftTargetRegionId = ref<string | null>(null);
+  const shiftTargetMode = ref<'mean' | 'mode'>(
+    readPrefString(prefs, 'shiftTargetMode', 'mean', ['mean', 'mode']) as 'mean' | 'mode',
+  );
+  const shiftMigrateMode = ref<ColorShiftMode>(
+    readPrefString(prefs, 'shiftMigrateMode', 'offset', ['offset', 'hue', 'match']) as ColorShiftMode,
+  );
+  const shiftPickedColor = ref<[number, number, number] | null>(null);
+  const shiftManualColor = ref(readPrefString(prefs, 'shiftManualColor', '#3b82f6'));
+  const shiftStrength = ref(readPrefNumber(prefs, 'shiftStrength', 80, 0, 100));
+
+  // ---------- 偏好保存（防抖 300ms，参数变化时写 localStorage） ----------
+  let prefSaveTimer: number | null = null;
+  function schedulePrefsSave(): void {
+    if (prefSaveTimer != null) window.clearTimeout(prefSaveTimer);
+    prefSaveTimer = window.setTimeout(() => {
+      prefSaveTimer = null;
+      savePrefs({
+        activeTool: activeTool.value,
+        brushSize: brushSize.value,
+        brushHardness: brushHardness.value,
+        brushMode: brushMode.value,
+        marqueeMode: marqueeMode.value,
+        fillColor: fillColor.value,
+        wandTolerance: wandTolerance.value,
+        wandContiguous: wandContiguous.value,
+        featherRadius: featherRadius.value,
+        morphRadius: morphRadius.value,
+        gradientColor1: gradientColor1.value,
+        gradientColor2: gradientColor2.value,
+        gradientAngle: gradientAngle.value,
+        gradientRange: [...gradientRange.value],
+        inpaintRadius: inpaintRadius.value,
+        shiftTargetSource: shiftTargetSource.value,
+        shiftTargetMode: shiftTargetMode.value,
+        shiftMigrateMode: shiftMigrateMode.value,
+        shiftManualColor: shiftManualColor.value,
+        shiftStrength: shiftStrength.value,
+        exportFormat: exportFormat.value,
+        exportQuality: exportQuality.value,
+        exportBackground: exportBackground.value,
+        maskDisplayMode: maskDisplayMode.value,
+      });
+    }, 300);
+  }
+
+  watch(
+    [
+      activeTool,
+      brushSize,
+      brushHardness,
+      brushMode,
+      marqueeMode,
+      fillColor,
+      wandTolerance,
+      wandContiguous,
+      featherRadius,
+      morphRadius,
+      gradientColor1,
+      gradientColor2,
+      gradientAngle,
+      gradientRange,
+      inpaintRadius,
+      shiftTargetSource,
+      shiftTargetMode,
+      shiftMigrateMode,
+      shiftManualColor,
+      shiftStrength,
+      exportFormat,
+      exportQuality,
+      exportBackground,
+      maskDisplayMode,
+    ],
+    () => schedulePrefsSave(),
+  );
+  const colorPickActive = ref(false);
+  let shiftPixelCache: { version: number; data: Uint8ClampedArray } | null = null;
+  let shiftGrayCache: { version: number; data: Uint8ClampedArray } | null = null;
 
   // ---------- 状态栏 ----------
   const cursorX = ref(0);
@@ -263,18 +419,39 @@ export const useEditorStore = defineStore('editor', () => {
       height: row.height,
       createdAt: row.createdAt,
       originNote: row.originNote,
-      originalBlob: row.originalBlob,
-      thumbBlob: row.thumbBlob,
+      originalBlob: null,
+      originalUrl: row.originalUrl,
+      thumbBlob: null,
+      thumbUrl: row.thumbUrl,
       currentId: row.currentHistoryId,
       history: null,
-      regions: null,
+      regionRegistry: null,
     };
+  }
+
+  /** 取某历史版本上包含的区域（按注册表映射 regionIds） */
+  function regionsForNode(node: HistoryNode): Region[] {
+    const registry = activeImage.value?.regionRegistry ?? [];
+    const byId = new Map(registry.map((r) => [r.id, r] as const));
+    const list: Region[] = [];
+    for (const id of node.regionIds ?? []) {
+      const region = byId.get(id);
+      if (region) list.push(region);
+    }
+    return list;
   }
 
   async function ensureActiveProject(): Promise<string> {
     if (activeProjectId.value) return activeProjectId.value;
     const now = Date.now();
-    const row: ProjectRow = { id: newId('p'), name: '未命名项目', createdAt: now, updatedAt: now };
+    const row: ProjectRow = {
+      id: newId('p'),
+      folder: '',
+      name: '未命名项目',
+      createdAt: now,
+      updatedAt: now,
+      imageCount: 0,
+    };
     projects.value.unshift(row);
     activeProjectId.value = row.id;
     bumpData();
@@ -321,7 +498,6 @@ export const useEditorStore = defineStore('editor', () => {
     const img = projectImages.value.find((i) => i.id === activeImageId.value);
     if (img) {
       img.history = history;
-      img.regions = regions.value;
       img.currentId = history.currentId;
     }
     sessionCache.delete(activeImageId.value);
@@ -371,8 +547,9 @@ export const useEditorStore = defineStore('editor', () => {
     maskManager = cached.maskManager;
     maskRenderer = cached.maskRenderer;
     history = cached.history;
-    regions.value = img.regions ?? [];
     applyImageState(img);
+    const cachedNode = history.current;
+    regions.value = cachedNode ? regionsForNode(cachedNode) : [];
     return true;
   }
 
@@ -393,9 +570,12 @@ export const useEditorStore = defineStore('editor', () => {
   async function buildSessionForImage(
     img: ProjectImage,
     hist: HistoryManager,
-    regs: Region[],
     currentBlob: Blob,
   ): Promise<void> {
+    if (!img.originalBlob) {
+      if (!img.originalUrl) throw new Error(`图片「${img.name}」的原图数据缺失`);
+      img.originalBlob = await projectStorage.fetchBlob(img.originalUrl);
+    }
     const originalBmp = await createImageBitmap(img.originalBlob);
     const currentBmp = await createImageBitmap(currentBlob);
     originalBitmap.value = originalBmp;
@@ -408,8 +588,9 @@ export const useEditorStore = defineStore('editor', () => {
     maskManager = new SelectionManager(img.width, img.height);
     maskRenderer = new MaskRenderer();
     history = hist;
-    regions.value = regs;
     applyImageState(img);
+    const builtNode = hist.current;
+    regions.value = builtNode ? regionsForNode(builtNode) : [];
   }
 
   async function switchImageInternal(imageId: string): Promise<void> {
@@ -419,29 +600,52 @@ export const useEditorStore = defineStore('editor', () => {
     if (restoreCachedSession(imageId)) return;
     let hist = target.history;
     if (!hist) {
-      const nodes = await projectStorage.loadNodes(imageId);
+      const nodes = openedProject?.nodesOf(imageId) ?? [];
       if (nodes.length === 0) throw new Error(`图片「${target.name}」的历史数据缺失`);
       hist = new HistoryManager();
       hist.restore(nodes, target.currentId);
       target.history = hist;
     }
-    let regs = target.regions;
-    if (!regs) {
-      const rows = await projectStorage.loadRegions(imageId);
-      regs = [];
+    let registry = target.regionRegistry;
+    if (!registry) {
+      const rows = openedProject ? await openedProject.regionsOf(imageId) : [];
+      registry = [];
       for (const row of rows) {
-        regs.push({
+        registry.push({
           id: row.id,
           name: row.name,
           locked: row.locked,
           gray: await decodeGrayBlob(row.grayBlob),
-          thumbBlob: row.thumbBlob,
+          thumbBlob: null,
+          thumbUrl: row.thumbUrl,
         });
       }
-      target.regions = regs;
+      target.regionRegistry = registry;
+      // 旧数据兼容：没有 regionIds 的节点视为空集，当前节点继承该图片的全部区域
+      const currentNode = hist.getNode(hist.currentId);
+      const currentLegacy = !!currentNode && currentNode.regionIds === undefined;
+      for (const node of hist.allNodes()) {
+        if (!Array.isArray(node.regionIds)) node.regionIds = [];
+      }
+      if (currentLegacy && currentNode) {
+        currentNode.regionIds = registry.map((r) => r.id);
+      }
     }
-    const currentBlob = hist.getNode(hist.currentId)?.imageBlob ?? target.originalBlob;
-    await buildSessionForImage(target, hist, regs, currentBlob);
+    // 当前版本快照：磁盘节点按需拉取；再回落到原图
+    const currentNode = hist.getNode(hist.currentId);
+    let currentBlob = currentNode?.imageBlob ?? null;
+    if (!currentBlob && currentNode?.snapshotUrl) {
+      currentBlob = await projectStorage.fetchBlob(currentNode.snapshotUrl);
+      currentNode.imageBlob = currentBlob;
+    }
+    if (!currentBlob) {
+      if (!target.originalBlob) {
+        if (!target.originalUrl) throw new Error(`图片「${target.name}」的数据缺失`);
+        target.originalBlob = await projectStorage.fetchBlob(target.originalUrl);
+      }
+      currentBlob = target.originalBlob;
+    }
+    await buildSessionForImage(target, hist, currentBlob);
   }
 
   async function switchImage(imageId: string): Promise<void> {
@@ -486,15 +690,17 @@ export const useEditorStore = defineStore('editor', () => {
       createdAt: Date.now(),
       originNote,
       originalBlob: sourceBlob,
+      originalUrl: null,
       thumbBlob: thumb,
+      thumbUrl: null,
       currentId: -1,
       history: null,
-      regions: null,
+      regionRegistry: null,
     };
     const hm = new HistoryManager();
     const root = hm.init(sourceBlob, thumb, rootLabel ?? (originNote ? `导入（${originNote}）` : '原图'));
     img.history = hm;
-    img.regions = [];
+    img.regionRegistry = [];
     img.currentId = root.id;
     projectImages.value = [...projectImages.value, img];
     bumpData();
@@ -571,13 +777,14 @@ export const useEditorStore = defineStore('editor', () => {
     busyText.value = '复制图片到当前项目…';
     try {
       await ensureActiveProject();
-      const rows = await projectStorage.listImages(sourceProjectId);
-      const sourceRow = rows.find((i) => i.id === imageId);
+      const sourceFolder = projects.value.find((p) => p.id === sourceProjectId)?.folder;
+      if (!sourceFolder) throw new Error('源项目不存在');
+      const opened = await projectStorage.openProject(sourceFolder);
+      const sourceRow = opened.images.find((i) => i.id === imageId);
       if (!sourceRow) throw new Error('源图片不存在');
-      let blob: Blob = sourceRow.originalBlob;
-      const nodes = await projectStorage.loadNodes(imageId);
-      const current = nodes.find((n) => n.id === sourceRow.currentHistoryId);
-      if (current?.imageBlob) blob = current.imageBlob;
+      let blob: Blob = await projectStorage.fetchBlob(sourceRow.originalUrl);
+      const current = opened.nodesOf(imageId).find((n) => n.id === sourceRow.currentHistoryId);
+      if (current?.snapshotUrl) blob = await projectStorage.fetchBlob(current.snapshotUrl);
       const sourceProject = projects.value.find((p) => p.id === sourceProjectId);
       const origin = `来自项目「${sourceProject?.name ?? '未知'}」`;
       const img = await createImageAsset(blob, sourceRow.name, origin, `导入（${origin}的当前结果）`);
@@ -598,12 +805,33 @@ export const useEditorStore = defineStore('editor', () => {
       libraryVisible.value = false;
       return;
     }
+    // 切换项目会丢弃旧项目的内存状态：有未保存改动时先自动保存，失败则中止切换
+    if (hasImage.value && dirty.value) {
+      const previousName = activeProjectName.value;
+      await saveProject();
+      if (dirty.value) {
+        ElMessage.error('当前项目自动保存失败，已取消切换（请检查浏览器存储空间后重试）');
+        return;
+      }
+      ElMessage.info(`已自动保存「${previousName}」再切换`);
+    }
     busy.value = true;
     busyText.value = '切换项目…';
     try {
       stashActiveSession();
+      const row = projects.value.find((p) => p.id === projectId);
+      if (!row) throw new Error('项目不存在');
       activeProjectId.value = projectId;
-      projectImages.value = (await projectStorage.listImages(projectId)).map(rowToProjectImage);
+      projectImages.value = [];
+      openedProject = null;
+      serverBlobNames = new Set();
+      if (row.folder) {
+        const opened = await projectStorage.openProject(row.folder);
+        openedProject = opened;
+        serverBlobNames = new Set(opened.blobNames);
+        row.folder = opened.project.folder;
+        projectImages.value = opened.images.map(rowToProjectImage);
+      }
       clearImageState();
       const remembered = lastImageByProject.get(projectId);
       const target =
@@ -611,7 +839,9 @@ export const useEditorStore = defineStore('editor', () => {
       if (target) await switchImageInternal(target.id);
       libraryVisible.value = false;
     } catch (err) {
-      ElMessage.error(`切换项目失败：${err instanceof Error ? err.message : String(err)}`);
+      ElMessage.error(
+        `切换项目失败：${err instanceof Error ? err.message : String(err)}（请确认后端已启动）`,
+      );
     } finally {
       busy.value = false;
       busyText.value = '';
@@ -622,9 +852,11 @@ export const useEditorStore = defineStore('editor', () => {
     const now = Date.now();
     const row: ProjectRow = {
       id: newId('p'),
+      folder: '',
       name: name.trim() || '未命名项目',
       createdAt: now,
       updatedAt: now,
+      imageCount: 0,
     };
     projects.value.unshift(row);
     bumpData();
@@ -689,12 +921,73 @@ export const useEditorStore = defineStore('editor', () => {
     refreshSelectionState();
   }
 
-  // ---------- 区域（固定/解锁） ----------
+  // ---------- 临时查看（按住显示，松开恢复；不改变任何编辑状态） ----------
 
-  function syncRegionsToActiveImage(): void {
-    const img = activeImage.value;
-    if (img) img.regions = regions.value;
+  /** 按住「显示区域」按钮时为 true */
+  const showRegions = ref(false);
+
+  /** 按住查看原图（showOriginal 语义改为：按住期间为 true） */
+  function pressOriginal(on: boolean): void {
+    showOriginal.value = on && hasImage.value;
   }
+
+  function pressRegions(on: boolean): void {
+    showRegions.value = on && hasImage.value && regions.value.length > 0;
+  }
+
+  const REGION_PALETTE = [
+    '#00e5ff',
+    '#ff5a1f',
+    '#22c55e',
+    '#eab308',
+    '#a855f7',
+    '#ef4444',
+    '#3b82f6',
+    '#ec4899',
+  ];
+
+  /** 区域配色（按 id 哈希，稳定且无需存储） */
+  function regionColorOf(regionId: string): string {
+    let hash = 0;
+    for (let i = 0; i < regionId.length; i++) hash = (hash * 31 + regionId.charCodeAt(i)) >>> 0;
+    return REGION_PALETTE[hash % REGION_PALETTE.length];
+  }
+
+  let regionsViewCache: { key: string; canvas: HTMLCanvasElement } | null = null;
+
+  /** 所有区域的可视化画布（不同区域不同颜色，固定的区域颜色更实；按需构建并缓存） */
+  function getRegionsViewCanvas(): HTMLCanvasElement | null {
+    if (!hasImage.value || regions.value.length === 0) return null;
+    const w = imageWidth.value;
+    const h = imageHeight.value;
+    const key = `${activeImageId.value}:${regions.value
+      .map((r) => `${r.id}${r.locked ? 'L' : ''}`)
+      .join(',')}`;
+    if (regionsViewCache && regionsViewCache.key === key) return regionsViewCache.canvas;
+    const out = document.createElement('canvas');
+    out.width = w;
+    out.height = h;
+    const octx = out.getContext('2d')!;
+    const layer = document.createElement('canvas');
+    layer.width = w;
+    layer.height = h;
+    const lctx = layer.getContext('2d')!;
+    for (const region of regions.value) {
+      lctx.globalCompositeOperation = 'source-over';
+      lctx.clearRect(0, 0, w, h);
+      lctx.putImageData(new ImageData(grayToRgba(region.gray), w, h), 0, 0);
+      lctx.globalCompositeOperation = 'source-in';
+      lctx.fillStyle = regionColorOf(region.id);
+      lctx.fillRect(0, 0, w, h);
+      octx.globalAlpha = region.locked ? 0.9 : 0.6;
+      octx.drawImage(layer, 0, 0);
+    }
+    octx.globalAlpha = 1;
+    regionsViewCache = { key, canvas: out };
+    return out;
+  }
+
+  // ---------- 区域（固定/解锁；随历史版本保存与切换） ----------
 
   async function saveCurrentRegion(name: string): Promise<void> {
     if (!maskManager || !hasSelection.value) {
@@ -709,13 +1002,15 @@ export const useEditorStore = defineStore('editor', () => {
     try {
       const gray = maskManager.getGrayMask();
       const thumb = await grayToThumbBlob(gray, img.width, img.height);
-      regions.value = [
-        ...regions.value,
-        { id: newId('rg'), name: trimmed, locked: false, gray, thumbBlob: thumb },
-      ];
-      syncRegionsToActiveImage();
+      const region: Region = { id: newId('rg'), name: trimmed, locked: false, gray, thumbBlob: thumb };
+      // 区域对象进入图片级注册表；当前历史版本记录其 id（撤销/跳转版本时区域列表随版本切换）
+      if (!img.regionRegistry) img.regionRegistry = [];
+      img.regionRegistry.push(region);
+      const node = history?.current;
+      if (node) node.regionIds = [...(node.regionIds ?? []), region.id];
+      regions.value = node ? regionsForNode(node) : [region];
       bumpData();
-      ElMessage.success(`已保存区域「${trimmed}」`);
+      ElMessage.success(`已保存区域「${trimmed}」（随当前历史版本保存）`);
     } catch (err) {
       ElMessage.error(`区域保存失败：${err instanceof Error ? err.message : String(err)}`);
     } finally {
@@ -737,15 +1032,17 @@ export const useEditorStore = defineStore('editor', () => {
   function toggleRegionLock(regionId: string): void {
     const region = regions.value.find((r) => r.id === regionId);
     if (!region) return;
+    // 锁定状态存于共享区域对象上（跨版本共享同一把"锁"）
     region.locked = !region.locked;
     regions.value = [...regions.value]; // shallowRef 下显式触发更新
-    syncRegionsToActiveImage();
     bumpData();
   }
 
   function deleteRegion(regionId: string): void {
+    // 仅从当前历史版本移除；其他版本（若仍引用该区域）不受影响
+    const node = history?.current;
+    if (node) node.regionIds = (node.regionIds ?? []).filter((id) => id !== regionId);
     regions.value = regions.value.filter((r) => r.id !== regionId);
-    syncRegionsToActiveImage();
     bumpData();
   }
 
@@ -765,9 +1062,13 @@ export const useEditorStore = defineStore('editor', () => {
 
   // ---------- 编辑操作 ----------
 
-  async function applyEdit(op: PixelOp, label: string): Promise<void> {
+  async function applyEdit(
+    op: PixelOp,
+    label: string,
+    maskOverride?: Uint8ClampedArray,
+  ): Promise<void> {
     if (!editedCtx || !editedCanvas || !maskManager || !history || busy.value) return;
-    if (!hasSelection.value && !regions.value.some((r) => r.locked)) {
+    if (!maskOverride && !hasSelection.value && !regions.value.some((r) => r.locked)) {
       ElMessage.warning('当前没有选区，请先使用选择工具创建选区');
       return;
     }
@@ -777,7 +1078,9 @@ export const useEditorStore = defineStore('editor', () => {
       const w = imageWidth.value;
       const h = imageHeight.value;
       const imgData = editedCtx.getImageData(0, 0, w, h);
-      const gray = effectiveGrayMask();
+      // 显式指定蒙版时（如色彩靠近的应用对象）不再附加固定区域；
+      // 注意必须拷贝：Worker 会转移（transfer）蒙版缓冲，直接传引用会清空区域数据
+      const gray = maskOverride ? new Uint8ClampedArray(maskOverride) : effectiveGrayMask();
       const out = await editOps.apply(imgData.data, gray, op, w, h);
       editedCtx.putImageData(new ImageData(out, w, h), 0, 0);
       imageVersion.value++;
@@ -815,8 +1118,12 @@ export const useEditorStore = defineStore('editor', () => {
     busy.value = true;
     busyText.value = '恢复历史版本…';
     try {
-      if (node.imageBlob) {
-        const bmp = await createImageBitmap(node.imageBlob);
+      // 磁盘存储的快照按需拉取并缓存回内存（撤销/跳转时）
+      const snapshot =
+        node.imageBlob ?? (node.snapshotUrl ? await projectStorage.fetchBlob(node.snapshotUrl) : null);
+      if (snapshot) {
+        node.imageBlob = snapshot;
+        const bmp = await createImageBitmap(snapshot);
         editedCtx.clearRect(0, 0, imageWidth.value, imageHeight.value);
         editedCtx.drawImage(bmp, 0, 0);
         bmp.close();
@@ -831,6 +1138,8 @@ export const useEditorStore = defineStore('editor', () => {
       currentHistoryId.value = history?.currentId ?? -1;
       historyVersion.value++;
       updateHistoryFlags();
+      // 区域列表随历史版本切换（每个版本记录自己的区域集合）
+      regions.value = regionsForNode(node);
       bumpData();
     } catch (err) {
       ElMessage.error(`历史版本恢复失败：${err instanceof Error ? err.message : String(err)}`);
@@ -1161,22 +1470,183 @@ export const useEditorStore = defineStore('editor', () => {
     );
   }
 
+  // ---------- 色彩靠近（向目标色迁移） ----------
+
+  /** 目标区域的灰度蒙版（当前选区或已保存区域） */
+  function getShiftTargetGray(): Uint8ClampedArray | null {
+    if (!maskManager) return null;
+    if (shiftTargetRegionId.value) {
+      const region = regions.value.find((r) => r.id === shiftTargetRegionId.value);
+      return region ? region.gray : null;
+    }
+    if (!hasSelection.value) return null;
+    if (!shiftGrayCache || shiftGrayCache.version !== maskVersion.value) {
+      shiftGrayCache = { version: maskVersion.value, data: maskManager.getGrayMask() };
+    }
+    return shiftGrayCache.data;
+  }
+
+  /** 确保图像像素缓存为最新 */
+  function ensureShiftPixelCache(): Uint8ClampedArray | null {
+    if (!editedCtx) return null;
+    if (!shiftPixelCache || shiftPixelCache.version !== imageVersion.value) {
+      const w = imageWidth.value;
+      const h = imageHeight.value;
+      shiftPixelCache = {
+        version: imageVersion.value,
+        data: editedCtx.getImageData(0, 0, w, h).data,
+      };
+    }
+    return shiftPixelCache.data;
+  }
+
+  /** 计算当前设置下的目标色（选区/区域的均值或众数、取色点、手动色） */
+  function computeShiftTargetColor(): [number, number, number] | null {
+    if (shiftTargetSource.value === 'manual') return hexToRgb(shiftManualColor.value);
+    if (shiftTargetSource.value === 'pick') return shiftPickedColor.value;
+    const gray = getShiftTargetGray();
+    const pixels = ensureShiftPixelCache();
+    if (!gray || !pixels) return null;
+    return shiftTargetMode.value === 'mode'
+      ? maskedModeColor(pixels, gray)
+      : maskedMeanColor(pixels, gray);
+  }
+
+  /** 目标区域在 Lab 空间的颜色标准差（分布匹配用），采样步长 4 降低主线程开销 */
+  function computeTargetLabStd(gray: Uint8ClampedArray): [number, number, number] | null {
+    const pixels = ensureShiftPixelCache();
+    if (!pixels) return null;
+    let n = 0;
+    let mL = 0;
+    let mA = 0;
+    let mB = 0;
+    let sL = 0;
+    let sA = 0;
+    let sB = 0;
+    for (let i = 0; i < gray.length; i += 4) {
+      const m = gray[i];
+      if (m === 0) continue;
+      const p = i * 4;
+      const lab = rgbToLab(pixels[p], pixels[p + 1], pixels[p + 2]);
+      mL += lab[0];
+      mA += lab[1];
+      mB += lab[2];
+      sL += lab[0] * lab[0];
+      sA += lab[1] * lab[1];
+      sB += lab[2] * lab[2];
+      n++;
+    }
+    if (n === 0) return null;
+    const mean: [number, number, number] = [mL / n, mA / n, mB / n];
+    return [
+      Math.sqrt(Math.max(0, sL / n - mean[0] * mean[0])),
+      Math.sqrt(Math.max(0, sA / n - mean[1] * mean[1])),
+      Math.sqrt(Math.max(0, sB / n - mean[2] * mean[2])),
+    ];
+  }
+
+  function toggleColorPick(): void {
+    if (busy.value || !hasImage.value) return;
+    colorPickActive.value = !colorPickActive.value;
+    if (colorPickActive.value) {
+      ElMessage.info('请在画布上点击要取色的位置（Esc 取消）');
+    }
+  }
+
+  function cancelColorPick(): void {
+    colorPickActive.value = false;
+  }
+
+  /** 画布取色：取点击处 5×5 的平均色 */
+  function pickColorAt(x: number, y: number): void {
+    if (!editedCtx) return;
+    const cv = editedCtx.canvas;
+    const cx = Math.min(cv.width - 1, Math.max(0, Math.round(x)));
+    const cy = Math.min(cv.height - 1, Math.max(0, Math.round(y)));
+    const x0 = Math.min(Math.max(0, cx - 2), cv.width - 5);
+    const y0 = Math.min(Math.max(0, cy - 2), cv.height - 5);
+    const sw = Math.min(5, cv.width);
+    const sh = Math.min(5, cv.height);
+    const data = editedCtx.getImageData(x0, y0, sw, sh).data;
+    let r = 0;
+    let g = 0;
+    let b = 0;
+    const n = data.length / 4;
+    for (let i = 0; i < n; i++) {
+      r += data[i * 4];
+      g += data[i * 4 + 1];
+      b += data[i * 4 + 2];
+    }
+    const rgb: [number, number, number] = [Math.round(r / n), Math.round(g / n), Math.round(b / n)];
+    shiftPickedColor.value = rgb;
+    shiftTargetSource.value = 'pick';
+    colorPickActive.value = false;
+    ElMessage.success(`已取色 rgb(${rgb.join(', ')})`);
+  }
+
+  /** 执行色彩靠近：应用对象区域整体朝目标色迁移（保留明暗与纹理） */
+  async function applyColorShift(): Promise<void> {
+    if (!editedCtx || busy.value) return;
+    const target = computeShiftTargetColor();
+    if (!target) {
+      ElMessage.warning('无法确定目标颜色：请先选择目标区域、在画布上取色或设置手动颜色');
+      return;
+    }
+    let maskOverride: Uint8ClampedArray | undefined;
+    if (shiftApplyToRegionId.value) {
+      const region = regions.value.find((r) => r.id === shiftApplyToRegionId.value);
+      if (!region) {
+        ElMessage.warning('应用对象区域不存在');
+        return;
+      }
+      maskOverride = region.gray;
+    } else if (!hasSelection.value) {
+      ElMessage.warning('应用对象为「当前选区」，但当前没有选区');
+      return;
+    }
+    // 分布匹配模式：目标为区域/选区时取目标区域的 Lab 标准差；点色/手动色按零标准差处理
+    let targetStd: [number, number, number] | undefined;
+    if (shiftMigrateMode.value === 'match' && shiftTargetSource.value === 'selection') {
+      const targetGray = getShiftTargetGray();
+      if (targetGray) targetStd = computeTargetLabStd(targetGray) ?? undefined;
+    }
+    await applyEdit(
+      {
+        type: 'color_shift',
+        mode: shiftMigrateMode.value,
+        target,
+        targetStd,
+        strength: shiftStrength.value / 100,
+      },
+      '色彩靠近',
+      maskOverride,
+    );
+  }
+
   // ---------- 插入图片（画布合成） ----------
 
   /** 取得某张图片的“当前结果”内容（活跃缓存 / 内存历史 / 存储） */
-  async function currentResultBlobFor(projectId: string, imageId: string): Promise<Blob> {
+  async function currentResultBlobFor(
+    projectId: string,
+    imageId: string,
+  ): Promise<{ blob: Blob; name: string }> {
     if (projectId === activeProjectId.value) {
       const img = projectImages.value.find((i) => i.id === imageId);
       if (img?.history) {
-        return img.history.getNode(img.history.currentId)?.imageBlob ?? img.originalBlob;
+        const node = img.history.getNode(img.history.currentId);
+        if (node?.imageBlob) return { blob: node.imageBlob, name: img.name };
       }
     }
-    const rows = await projectStorage.listImages(projectId);
-    const row = rows.find((i) => i.id === imageId);
+    const folder = projects.value.find((p) => p.id === projectId)?.folder;
+    if (!folder) throw new Error('图片所在项目不存在');
+    const opened = await projectStorage.openProject(folder);
+    const row = opened.images.find((i) => i.id === imageId);
     if (!row) throw new Error('图片不存在');
-    const nodes = await projectStorage.loadNodes(imageId);
-    const current = nodes.find((n) => n.id === row.currentHistoryId);
-    return current?.imageBlob ?? row.originalBlob;
+    const current = opened.nodesOf(imageId).find((n) => n.id === row.currentHistoryId);
+    const blob = current?.snapshotUrl
+      ? await projectStorage.fetchBlob(current.snapshotUrl)
+      : await projectStorage.fetchBlob(row.originalUrl);
+    return { blob, name: row.name };
   }
 
   const insertBaseScale = ref(1);
@@ -1189,12 +1659,7 @@ export const useEditorStore = defineStore('editor', () => {
     busy.value = true;
     busyText.value = '准备插入图片…';
     try {
-      const rows = projectId === activeProjectId.value ? [] : await projectStorage.listImages(projectId);
-      const name =
-        projectImages.value.find((i) => i.id === imageId)?.name ??
-        rows.find((i) => i.id === imageId)?.name ??
-        '插入图片';
-      const blob = await currentResultBlobFor(projectId, imageId);
+      const { blob, name } = await currentResultBlobFor(projectId, imageId);
       const bitmap = await createImageBitmap(blob);
       const w = imageWidth.value;
       const h = imageHeight.value;
@@ -1307,100 +1772,290 @@ export const useEditorStore = defineStore('editor', () => {
       const activeRow = projects.value.find((p) => p.id === activeProjectId.value);
       if (!activeRow) throw new Error('项目不存在');
       activeRow.updatedAt = now;
-      // 注意：projects 是深层响应式数组，其元素是 Vue Proxy，
-      // 直接写入 IndexedDB 会报 "could not be cloned"，必须先转为纯对象
-      const projectRow: ProjectRow = { ...activeRow };
-      const imageRows: ImageRow[] = [];
-      const nodeRows: NodeRow[] = [];
-      const regionRows: RegionRow[] = [];
+
+      // 构建项目清单；只上传「服务端还没有的」Blob（按确定性文件名判断）
+      const files: File[] = [];
+      const referenced = new Set<string>();
+      const needUpload = (name: string, blob: Blob | null | undefined): void => {
+        referenced.add(name);
+        if (blob && !serverBlobNames.has(name)) files.push(new File([blob], name));
+      };
+
+      const images: ManifestImage[] = [];
+      let nodeCount = 0;
       for (const img of projectImages.value) {
-        imageRows.push({
+        const manifestImage: ManifestImage = {
           id: img.id,
-          projectId: projectRow.id,
           name: img.name,
           width: img.width,
           height: img.height,
-          originalBlob: img.originalBlob,
-          thumbBlob: img.thumbBlob,
           currentHistoryId: img.history ? img.history.currentId : img.currentId,
           originNote: img.originNote,
           createdAt: img.createdAt,
-        });
+          original: blobName.original(img.id),
+          thumb: img.thumbBlob ? blobName.imageThumb(img.id) : null,
+          nodes: [],
+          regions: [],
+        };
+        needUpload(manifestImage.original, img.originalBlob);
+        if (manifestImage.thumb) needUpload(manifestImage.thumb, img.thumbBlob);
         if (img.history) {
           for (const node of img.history.allNodes()) {
-            nodeRows.push({
-              dbKey: `${img.id}:${node.id}`,
-              imageId: img.id,
+            const manifestNode: ManifestNode = {
               id: node.id,
               parentId: node.parentId,
               childIds: [...node.childIds],
               op: node.op,
               time: node.time,
               label: node.label,
-              imageBlob: node.imageBlob,
-              thumbBlob: node.thumbBlob,
-            });
+              regionIds: [...(node.regionIds ?? [])],
+              snapshot: blobName.snapshot(img.id, node.id),
+              thumb: node.thumbBlob ? blobName.nodeThumb(img.id, node.id) : null,
+            };
+            needUpload(manifestNode.snapshot, node.imageBlob);
+            if (manifestNode.thumb) needUpload(manifestNode.thumb, node.thumbBlob);
+            manifestImage.nodes.push(manifestNode);
+            nodeCount++;
           }
         }
-        if (img.regions) {
+        if (img.regionRegistry) {
+          // 只保存仍被某个历史版本引用的区域；区域与版本的归属通过节点 regionIds 记录
+          const referencedRegions = new Set<string>();
+          if (img.history) {
+            for (const node of img.history.allNodes()) {
+              for (const id of node.regionIds ?? []) referencedRegions.add(id);
+            }
+          }
           let order = 0;
-          for (const region of img.regions) {
-            regionRows.push({
+          for (const region of img.regionRegistry) {
+            if (!referencedRegions.has(region.id)) continue;
+            const manifestRegion: ManifestRegion = {
               id: region.id,
-              imageId: img.id,
               name: region.name,
               locked: region.locked,
               order: order++,
-              grayBlob: await grayMaskToPngBlob(region.gray, img.width, img.height),
-              thumbBlob: region.thumbBlob,
-            });
+              gray: blobName.regionGray(region.id),
+              thumb: region.thumbBlob ? blobName.regionThumb(region.id) : null,
+            };
+            referenced.add(manifestRegion.gray);
+            if (!serverBlobNames.has(manifestRegion.gray)) {
+              files.push(
+                new File([await grayMaskToPngBlob(region.gray, img.width, img.height)], manifestRegion.gray),
+              );
+            }
+            if (manifestRegion.thumb) needUpload(manifestRegion.thumb, region.thumbBlob);
+            manifestImage.regions.push(manifestRegion);
           }
         }
+        images.push(manifestImage);
       }
-      await projectStorage.saveAll({
-        project: projectRow,
-        images: imageRows,
-        nodes: nodeRows,
-        regions: regionRows,
+
+      const manifest: ProjectManifest = {
+        id: activeRow.id,
+        name: activeRow.name,
+        createdAt: activeRow.createdAt,
+        updatedAt: now,
         activeImageId: activeImageId.value,
-      });
+        images,
+      };
+      const result = await projectStorage.saveProject(activeRow.folder || null, manifest, files);
+      activeRow.folder = result.folder;
+      serverBlobNames = referenced;
+      if (openedProject && openedProject.project.id === activeRow.id) {
+        openedProject.project.folder = result.folder;
+      }
       savedDataVersion.value = dataVersion.value;
       savedAt.value = now;
       await refreshStorageEstimate();
       ElMessage.success(
-        `项目「${projectRow.name}」已保存（${imageRows.length} 张图片 · ${nodeRows.length} 个历史节点）`,
+        `项目「${activeRow.name}」已保存到 data/history/${result.folder}（${images.length} 张图片 · ${nodeCount} 个历史节点）`,
       );
     } catch (err) {
-      let message = err instanceof Error ? err.message : String(err);
-      if (err instanceof DOMException && err.name === 'QuotaExceededError') {
-        message = '浏览器存储空间不足：请导出图片后清理空间，或清理浏览器磁盘空间后重试';
-      }
-      ElMessage.error(`项目保存失败：${message}`);
+      const message = err instanceof Error ? err.message : String(err);
+      ElMessage.error(`项目保存失败：${message}（请确认后端已启动且磁盘可写）`);
     } finally {
       busy.value = false;
       busyText.value = '';
     }
   }
 
+  /** 把浏览器旧 IndexedDB 里的项目数据一次性迁移到 data/history（服务端已有同名项目则跳过） */
+  async function migrateLegacyStorageIfNeeded(): Promise<number> {
+    let legacy: LegacyIndexedDbStorage;
+    try {
+      legacy = new LegacyIndexedDbStorage();
+    } catch {
+      return 0;
+    }
+    let legacyProjects: Awaited<ReturnType<LegacyIndexedDbStorage['listProjects']>> = [];
+    try {
+      legacyProjects = await legacy.listProjects();
+    } catch {
+      return 0;
+    }
+    if (legacyProjects.length === 0) return 0;
+
+    const serverProjects = await projectStorage.listProjects();
+    const existingNames = new Set(serverProjects.map((p) => p.name));
+    const pending = legacyProjects.filter((p) => !existingNames.has(p.name));
+    if (pending.length === 0) return 0;
+
+    const legacyState = await legacy.loadAppState();
+    // 最近打开的项目放最后迁移，让服务端的 app_state 自然指向它
+    pending.sort(
+      (a, b) =>
+        (a.id === legacyState?.projectId ? 1 : 0) - (b.id === legacyState?.projectId ? 1 : 0),
+    );
+
+    let migrated = 0;
+    for (const legacyProject of pending) {
+      busy.value = true;
+      busyText.value = `迁移旧数据「${legacyProject.name}」…`;
+      try {
+        const rows = await legacy.listImages(legacyProject.id);
+        const manifest: ProjectManifest = {
+          id: legacyProject.id,
+          name: legacyProject.name,
+          createdAt: legacyProject.createdAt,
+          updatedAt: legacyProject.updatedAt,
+          activeImageId:
+            legacyProject.id === legacyState?.projectId ? (legacyState?.imageId ?? null) : null,
+          images: [],
+        };
+        const pendingFiles: File[] = [];
+        for (const row of rows) {
+          const nodes = await legacy.loadNodes(row.id);
+          const regions = await legacy.loadRegions(row.id);
+          const manifestImage: ManifestImage = {
+            id: row.id,
+            name: row.name,
+            width: row.width,
+            height: row.height,
+            currentHistoryId: row.currentHistoryId,
+            originNote: row.originNote,
+            createdAt: row.createdAt,
+            original: blobName.original(row.id),
+            thumb: row.thumbBlob ? blobName.imageThumb(row.id) : null,
+            nodes: [],
+            regions: [],
+          };
+          pendingFiles.push(new File([row.originalBlob], manifestImage.original));
+          if (manifestImage.thumb && row.thumbBlob) {
+            pendingFiles.push(new File([row.thumbBlob], manifestImage.thumb));
+          }
+          for (const node of nodes) {
+            const manifestNode: ManifestNode = {
+              id: node.id,
+              parentId: node.parentId,
+              childIds: [...node.childIds],
+              op: node.op,
+              time: node.time,
+              label: node.label,
+              regionIds: [...(node.regionIds ?? [])],
+              snapshot: blobName.snapshot(row.id, node.id),
+              thumb: node.thumbBlob ? blobName.nodeThumb(row.id, node.id) : null,
+            };
+            if (node.imageBlob) pendingFiles.push(new File([node.imageBlob], manifestNode.snapshot));
+            if (manifestNode.thumb && node.thumbBlob) {
+              pendingFiles.push(new File([node.thumbBlob], manifestNode.thumb));
+            }
+            manifestImage.nodes.push(manifestNode);
+          }
+          for (const region of regions) {
+            const manifestRegion: ManifestRegion = {
+              id: region.id,
+              name: region.name,
+              locked: region.locked,
+              order: region.order,
+              gray: blobName.regionGray(region.id),
+              thumb: region.thumbBlob ? blobName.regionThumb(region.id) : null,
+            };
+            pendingFiles.push(new File([region.grayBlob], manifestRegion.gray));
+            if (manifestRegion.thumb && region.thumbBlob) {
+              pendingFiles.push(new File([region.thumbBlob], manifestRegion.thumb));
+            }
+            manifestImage.regions.push(manifestRegion);
+          }
+          manifest.images.push(manifestImage);
+        }
+
+        // 1) 先写清单：创建项目文件夹（清单已引用全部文件，服务端清理不会误删）
+        const { folder } = await projectStorage.saveProject(null, manifest, []);
+        // 2) 分批上传 Blob（每批约 32MB，避免单请求过大）
+        const batchLimit = 32 * 1024 * 1024;
+        let batch: File[] = [];
+        let batchSize = 0;
+        const flush = async (): Promise<void> => {
+          if (batch.length === 0) return;
+          await projectStorage.uploadBlobs(folder, batch);
+          batch = [];
+          batchSize = 0;
+        };
+        for (const file of pendingFiles) {
+          if (batchSize + file.size > batchLimit) await flush();
+          batch.push(file);
+          batchSize += file.size;
+        }
+        await flush();
+        // 3) 再保存一次清单：刷新最近打开状态并清理残余
+        await projectStorage.saveProject(folder, manifest, []);
+        migrated++;
+      } catch (err) {
+        ElMessage.error(
+          `旧项目「${legacyProject.name}」迁移失败：${err instanceof Error ? err.message : String(err)}（浏览器旧数据保留，可重启后重试）`,
+        );
+      } finally {
+        busy.value = false;
+        busyText.value = '';
+      }
+    }
+    return migrated;
+  }
+
+  /** 应用启动：先尝试迁移旧浏览器存储，再恢复最近打开的项目 */
+  async function initializeStorage(): Promise<void> {
+    if (hasImage.value || busy.value) return;
+    try {
+      const migrated = await migrateLegacyStorageIfNeeded();
+      if (migrated > 0) {
+        ElMessage.success(
+          `已把 ${migrated} 个旧项目迁移到项目目录 data/history（浏览器旧数据保留作备份）`,
+        );
+      }
+    } catch {
+      /* 后端未启动等情况：跳过迁移，不影响编辑 */
+    }
+    await tryRestoreProject();
+  }
+
   async function tryRestoreProject(): Promise<boolean> {
     if (hasImage.value || busy.value) return false;
     busy.value = true;
-    busyText.value = '检查上次保存的项目…';
+    busyText.value = '检查磁盘上的项目…';
     try {
       projects.value = await projectStorage.listProjects();
       const appState = await projectStorage.loadAppState();
-      if (!appState?.projectId) return false;
-      if (!projects.value.some((p) => p.id === appState.projectId)) return false;
-      activeProjectId.value = appState.projectId;
-      projectImages.value = (await projectStorage.listImages(appState.projectId)).map(
-        rowToProjectImage,
-      );
+      if (!appState?.projectId && !appState?.folder) return false;
+      const row =
+        projects.value.find((p) => p.id === appState.projectId) ??
+        projects.value.find((p) => p.folder === appState.folder);
+      if (!row) return false;
+      activeProjectId.value = row.id;
+      openedProject = null;
+      serverBlobNames = new Set();
+      const opened = await projectStorage.openProject(row.folder);
+      openedProject = opened;
+      serverBlobNames = new Set(opened.blobNames);
+      row.folder = opened.project.folder;
+      row.name = opened.project.name;
+      projectImages.value = opened.images.map(rowToProjectImage);
+      clearImageState();
       if (projectImages.value.length === 0) return false;
       const target =
         projectImages.value.find((i) => i.id === appState.imageId) ?? projectImages.value[0];
       await switchImageInternal(target.id);
       savedDataVersion.value = dataVersion.value;
-      savedAt.value = projects.value.find((p) => p.id === activeProjectId.value)?.updatedAt ?? null;
+      savedAt.value = row.updatedAt;
       void refreshStorageEstimate();
       ElMessage.success(
         `已恢复项目「${activeProjectName.value}」的图片「${target.name}」（${projectImages.value.length} 张图片）`,
@@ -1408,7 +2063,7 @@ export const useEditorStore = defineStore('editor', () => {
       return true;
     } catch (err) {
       ElMessage.error(
-        `项目恢复失败：${err instanceof Error ? err.message : String(err)}（存储数据已保留，可继续导入图片）`,
+        `项目恢复失败：${err instanceof Error ? err.message : String(err)}（请确认后端已启动；磁盘数据未受影响）`,
       );
       return false;
     } finally {
@@ -1418,7 +2073,8 @@ export const useEditorStore = defineStore('editor', () => {
   }
 
   async function refreshStorageEstimate(): Promise<void> {
-    storageUsage.value = await projectStorage.usage();
+    const usageInfo = await projectStorage.usage();
+    storageUsage.value = usageInfo ? { usage: usageInfo.bytes, quota: 0 } : null;
   }
 
   // ---------- 只读访问器 ----------
@@ -1467,6 +2123,7 @@ export const useEditorStore = defineStore('editor', () => {
     storageUsage,
     saveProject,
     tryRestoreProject,
+    initializeStorage,
     refreshStorageEstimate,
     // 编辑
     busy,
@@ -1498,6 +2155,12 @@ export const useEditorStore = defineStore('editor', () => {
     marqueeMode,
     fillColor,
     showOriginal,
+    // 导出选项（跨项目记忆）
+    exportFormat,
+    exportQuality,
+    exportBackground,
+    // 选区显示模式（跨项目记忆）
+    maskDisplayMode,
     // 阶段三参数
     wandTolerance,
     wandContiguous,
@@ -1508,6 +2171,12 @@ export const useEditorStore = defineStore('editor', () => {
     gradientAngle,
     gradientRange,
     inpaintRadius,
+    // 临时查看（按住显示）
+    showRegions,
+    pressOriginal,
+    pressRegions,
+    regionColorOf,
+    getRegionsViewCanvas,
     magicWandAt,
     featherMask,
     growMask,
@@ -1515,6 +2184,21 @@ export const useEditorStore = defineStore('editor', () => {
     smoothMaskEdge,
     gradientFill,
     neighborhoodFill,
+    // 色彩靠近
+    shiftApplyToRegionId,
+    shiftTargetSource,
+    shiftTargetRegionId,
+    shiftTargetMode,
+    shiftMigrateMode,
+    shiftPickedColor,
+    shiftManualColor,
+    shiftStrength,
+    colorPickActive,
+    toggleColorPick,
+    cancelColorPick,
+    pickColorAt,
+    computeShiftTargetColor,
+    applyColorShift,
     // 状态栏
     cursorX,
     cursorY,

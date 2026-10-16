@@ -88,4 +88,17 @@ describe('HistoryManager：多分支历史树', () => {
     expect(h.currentId).toBe(n2.id);
     expect(h.count).toBe(3);
   });
+
+  it('区域随历史版本记录：根节点为空、子节点继承父集合且相互独立', () => {
+    const h = new HistoryManager();
+    const root = h.init(fakeBlob(), null);
+    expect(root.regionIds).toEqual([]);
+    root.regionIds = ['r1'];
+    const child = h.addEdit({ type: 'solid' }, fakeBlob(), null);
+    expect(child.regionIds).toEqual(['r1']); // 继承
+    child.regionIds!.push('r2');
+    expect(root.regionIds).toEqual(['r1']); // 副本，互不影响
+    const grand = h.addEdit({ type: 'transparent' }, fakeBlob(), null);
+    expect(grand.regionIds).toEqual(['r1', 'r2']);
+  });
 });

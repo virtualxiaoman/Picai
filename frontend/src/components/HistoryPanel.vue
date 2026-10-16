@@ -35,6 +35,7 @@ const previewUrl = ref('');
 const previewVisible = ref(false);
 
 function thumbUrl(node: HistoryNode): string | null {
+  if (node.thumbUrl) return node.thumbUrl; // 磁盘存储：直接使用服务端 URL
   if (!node.thumbBlob) return null;
   let url = thumbUrls.get(node.id);
   if (!url) {
@@ -110,22 +111,28 @@ const graph = computed<GraphData>(() => {
   };
 });
 
+let previewIsObjectUrl = false;
+
 function openPreview(node: HistoryNode): void {
-  if (!node.imageBlob) {
+  const url =
+    node.snapshotUrl ?? (node.imageBlob ? URL.createObjectURL(node.imageBlob) : null);
+  if (!url) {
     ElMessage.warning('该历史节点没有图像快照');
     return;
   }
   closePreviewUrl();
-  previewUrl.value = URL.createObjectURL(node.imageBlob);
+  previewIsObjectUrl = !node.snapshotUrl;
+  previewUrl.value = url;
   previewNode.value = node;
   previewVisible.value = true;
 }
 
 function closePreviewUrl(): void {
-  if (previewUrl.value) {
+  if (previewUrl.value && previewIsObjectUrl) {
     URL.revokeObjectURL(previewUrl.value);
-    previewUrl.value = '';
   }
+  previewUrl.value = '';
+  previewIsObjectUrl = false;
 }
 
 /** 对话框完全关闭后清理 */
@@ -196,6 +203,9 @@ onBeforeUnmount(() => {
         <p v-if="previewNode" class="history-preview-meta">
           {{ new Date(previewNode.time).toLocaleString('zh-CN') }} ·
           {{ previewNode.id === store.currentHistoryId ? '当前版本' : '非当前版本' }}
+          <template v-if="(previewNode.regionIds?.length ?? 0) > 0">
+            · 含 {{ previewNode.regionIds!.length }} 个区域
+          </template>
         </p>
       </div>
       <template #footer>

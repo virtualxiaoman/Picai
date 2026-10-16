@@ -2,13 +2,15 @@ import 'fake-indexeddb/auto';
 import { reactive } from 'vue';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { HistoryManager } from '../src/core/HistoryManager';
+// 历史数据已迁移到磁盘存储（data/history），IndexedDB 实现冻结为迁移读取器；
+// 这里测试的就是迁移读取器（新存储由后端 pytest 覆盖）。
 import {
-  ProjectStorage,
+  LegacyIndexedDbStorage as ProjectStorage,
   type ImageRow,
   type NodeRow,
   type ProjectRow,
   type RegionRow,
-} from '../src/core/ProjectStorage';
+} from '../src/core/legacyIndexedDb';
 
 let storage: ProjectStorage;
 
@@ -59,6 +61,7 @@ function nodeRowsFor(imageId: string, h: HistoryManager): NodeRow[] {
     label: n.label,
     imageBlob: n.imageBlob,
     thumbBlob: n.thumbBlob,
+    regionIds: [...(n.regionIds ?? [])],
   }));
 }
 
@@ -67,6 +70,7 @@ describe('ProjectStorage（v3 多项目 schema）', () => {
     const h = new HistoryManager();
     const root = h.init(new Blob(['root-image']), new Blob(['t0']));
     const b = h.addEdit({ type: 'solid' }, new Blob(['node-b']), new Blob(['tb']), '纯色替换');
+    b.regionIds = ['rg-1']; // 该历史版本记录了区域归属
     h.undo();
     h.addEdit({ type: 'transparent' }, new Blob(['node-d']), new Blob(['td']), '透明化');
 
@@ -104,7 +108,7 @@ describe('ProjectStorage（v3 多项目 schema）', () => {
     expect(images.map((i) => i.id)).toEqual(['img-a', 'img-b']);
     expect(await (images[0].originalBlob as Blob).text()).toBe('orig-img-a');
 
-    // 历史节点往返（含 Blob 快照与分支结构）
+    // 历史节点往返（含 Blob 快照、分支结构与区域归属）
     const nodes = await storage.loadNodes('img-a');
     expect(nodes.length).toBe(3);
     const h2 = new HistoryManager();
@@ -112,6 +116,7 @@ describe('ProjectStorage（v3 多项目 schema）', () => {
     expect(h2.currentId).toBe(b.id);
     expect(h2.children(root.id).length).toBe(2);
     expect(await (h2.getNode(b.id)!.imageBlob as Blob).text()).toBe('node-b');
+    expect(h2.getNode(b.id)!.regionIds).toEqual(['rg-1']);
 
     // 区域往返
     const regions = await storage.loadRegions('img-a');
@@ -250,6 +255,8 @@ describe('ProjectStorage（v3 多项目 schema）', () => {
     expect(nodes.length).toBe(2);
     expect(nodes[1].parentId).toBe(1);
     expect(await (nodes[1].imageBlob as Blob).text()).toBe('edit');
+    // 旧数据没有 regionIds 字段：保留 undefined，由上层做兼容（当前版本继承全部区域）
+    expect(nodes[0].regionIds).toBeUndefined();
 
     const appState = await storage.loadAppState();
     expect(appState?.projectId).toBe(projects[0].id);

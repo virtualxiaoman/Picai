@@ -38,7 +38,9 @@ async function refresh(): Promise<void> {
     const others = store.projects.filter((p) => p.id !== store.activeProjectId);
     const data: { project: ProjectRow; images: ImageRow[] }[] = [];
     for (const project of others) {
-      data.push({ project, images: await projectStorage.listImages(project.id) });
+      if (!project.folder) continue;
+      const opened = await projectStorage.openProject(project.folder);
+      data.push({ project, images: opened.images });
     }
     otherData.value = data;
   } catch (err) {
@@ -68,6 +70,11 @@ function thumbUrlFor(key: string, blob: Blob | null): string | null {
     thumbUrls.set(key, url);
   }
   return url;
+}
+
+/** 当前项目图片缩略图：磁盘项目用服务端 URL，本地新导入用 Blob */
+function currentThumb(img: ProjectImage): string | null {
+  return img.thumbUrl ?? thumbUrlFor(`c-${img.id}`, img.thumbBlob);
 }
 
 async function onPickCurrent(img: ProjectImage): Promise<void> {
@@ -195,7 +202,7 @@ onBeforeUnmount(cleanupUrls);
         :title="img.name"
         @click="void onPickCurrent(img)"
       >
-        <img v-if="thumbUrlFor(`c-${img.id}`, img.thumbBlob)" :src="thumbUrlFor(`c-${img.id}`, img.thumbBlob)!" alt="" />
+        <img v-if="currentThumb(img)" :src="currentThumb(img)!" alt="" />
         <div v-else class="lib-thumb-empty" />
         <div class="lib-name">{{ img.name }}</div>
         <div class="lib-meta">
@@ -236,7 +243,7 @@ onBeforeUnmount(cleanupUrls);
               :title="row.name"
               @click="void onPickOther(item.project.id, row)"
             >
-              <img v-if="thumbUrlFor(row.id, row.thumbBlob)" :src="thumbUrlFor(row.id, row.thumbBlob)!" alt="" />
+              <img v-if="row.thumbUrl" :src="row.thumbUrl" alt="" />
               <div v-else class="lib-thumb-empty" />
               <div class="lib-name">{{ row.name }}</div>
               <div class="lib-meta">{{ row.width }}×{{ row.height }}</div>
