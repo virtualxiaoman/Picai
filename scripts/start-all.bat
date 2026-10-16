@@ -1,8 +1,9 @@
 @echo off
-chcp 65001 >nul
+rem ×¢Òâ£º±¾ÎÄ¼şÎª GBK ±àÂë£¬ÇëÎğÁí´æÎª UTF-8
 cd /d "%~dp0"
-echo åŒæ—¶å¯åŠ¨ Picai å‰åç«¯...
-start "Picai åç«¯" cmd /k "%~dp0start-backend.bat"
-timeout /t 3 /nobreak >nul
-start "Picai å‰ç«¯" cmd /k "%~dp0start-frontend.bat"
-echo å·²å¯åŠ¨ã€‚æµè§ˆå™¨è®¿é—® http://localhost:5173
+echo Í¬Ê±Æô¶¯ Picai Ç°ºó¶Ë...
+start "Picai ºó¶Ë - ¹Ø±Õ´Ë´°¿Ú¿ÉÍ£Ö¹·şÎñ" cmd /k ""%~dp0start-backend.bat""
+ping -n 3 127.0.0.1 >nul
+start "Picai Ç°¶Ë - ¹Ø±Õ´Ë´°¿Ú¿ÉÍ£Ö¹·şÎñ" cmd /k ""%~dp0start-frontend.bat""
+echo ÒÑÆô¶¯¡£ä¯ÀÀÆ÷·ÃÎÊ http://localhost:5173
+pause
