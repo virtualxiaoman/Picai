@@ -147,6 +147,14 @@ export class ProjectStorage {
     return res.blob();
   }
 
+  /** 读取原始清单（用于修复/诊断类操作） */
+  async loadManifestRaw(folder: string): Promise<ProjectManifest> {
+    const data = await toJson<{ manifest: ProjectManifest }>(
+      await fetch(`/api/storage/projects/${encodeURIComponent(folder)}`),
+    );
+    return data.manifest;
+  }
+
   /** 打开项目：返回图片行、按需的历史节点（含快照 URL）与区域（灰度按需拉取） */
   async openProject(folder: string): Promise<OpenedProject> {
     const data = await toJson<{ manifest: ProjectManifest }>(

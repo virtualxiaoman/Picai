@@ -20,6 +20,8 @@ let panLast = { x: 0, y: 0 };
 let marqueeStart = { x: 0, y: 0 };
 let insertLast = { x: 0, y: 0 };
 
+const regionViewActive = computed(() => store.showRegions || !!store.regionPreviewId);
+
 const insertScalePercent = computed({
   get: () => Math.round(store.insertScale * 100),
   set: (value: number) => {
@@ -38,7 +40,7 @@ const isMarqueeTool = computed(
 
 const previews = computed<ToolPreview[]>(() => {
   const list: ToolPreview[] = [];
-  if (store.showRegions) return list; // 区域查看模式下不绘制任何工具预览
+  if (regionViewActive.value) return list; // 区域查看模式下不绘制任何工具预览
   if (store.insertState) {
     const s = store.insertState;
     list.push({
@@ -83,7 +85,7 @@ const previews = computed<ToolPreview[]>(() => {
 
 const cursorStyle = computed(() => {
   if (store.colorPickActive) return 'crosshair';
-  if (store.showRegions) return 'default';
+  if (regionViewActive.value) return 'default';
   if (store.insertState) return drag.value === 'insert' ? 'grabbing' : 'move';
   if (drag.value === 'pan') return 'grabbing';
   if (spaceDown.value) return 'grab';
@@ -114,12 +116,16 @@ function doRender(): void {
   const canvas = canvasRef.value;
   const container = containerRef.value;
   if (!canvas || !container) return;
-  const regionsView = store.showRegions ? store.getRegionsViewCanvas() : null;
+  const regionsView = store.showRegions
+    ? store.getRegionsViewCanvas()
+    : store.regionPreviewId
+      ? store.getRegionsViewCanvas(store.regionPreviewId)
+      : null;
   const maskManager = store.getMaskManager();
   const maskRenderer = store.getMaskRenderer();
   let overlay: HTMLCanvasElement | null = null;
   let differenceMask: HTMLCanvasElement | null = null;
-  if (maskManager && maskRenderer && !store.showOriginal && !store.showRegions) {
+  if (maskManager && maskRenderer && !store.showOriginal && !regionViewActive.value) {
     if (store.maskDisplayMode === 'difference') {
       differenceMask = maskManager.canvas;
     } else {
@@ -150,6 +156,7 @@ watchEffect(() => {
   void store.viewHeight;
   void store.showOriginal;
   void store.showRegions;
+  void store.regionPreviewId;
   void store.maskDisplayMode;
   void store.insertState;
   void previews.value;
@@ -179,7 +186,7 @@ function onPointerDown(event: PointerEvent): void {
     return;
   }
   if (event.button !== 0) return;
-  if (!store.hasImage || store.busy || store.showOriginal || store.showRegions) return;
+  if (!store.hasImage || store.busy || store.showOriginal || regionViewActive.value) return;
 
   const img = store.getViewport().toImage(screen);
   // 取色模式：点击画布采样颜色（色彩靠近的目标色）

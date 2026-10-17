@@ -110,6 +110,16 @@ function regionThumbUrl(region: Region): string | null {
   return url;
 }
 
+/** 按住区域缩略图：在画布区域单独预览该区域（松开恢复） */
+function startRegionPreview(region: Region, event: PointerEvent): void {
+  (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
+  store.pressRegionPreview(region.id);
+}
+
+function endRegionPreview(): void {
+  store.pressRegionPreview(null);
+}
+
 async function saveRegion(): Promise<void> {
   try {
     const { value } = await ElMessageBox.prompt(
@@ -217,10 +227,17 @@ async function applyTransparent(): Promise<void> {
   <div class="right-panel">
     <!-- 选区 -->
     <section class="panel-section">
-      <button class="section-header" :class="{ open: sections.selection }" @click="toggleSection('selection')">
-        <span class="section-title">选区</span>
-        <span class="section-caret">▾</span>
-      </button>
+      <el-tooltip
+        content="Ctrl+Z / Ctrl+Y：按发生顺序撤销 / 重做操作——选区变化（画笔、魔棒并集、区域合并、蒙版后处理、AI 蒙版）、图片编辑（透明化/替换/渐变/填充/插入）、区域保存/删除/固定等。工具栏的撤销/重做按钮用于图片版本树导航；手动切换版本后操作撤销历史会重置。"
+        placement="left"
+        popper-class="panel-hint-tooltip"
+        :show-after="250"
+      >
+        <button class="section-header" :class="{ open: sections.selection }" @click="toggleSection('selection')">
+          <span class="section-title">选区</span>
+          <span class="section-caret">▾</span>
+        </button>
+      </el-tooltip>
       <div v-if="sections.selection" class="section-body">
         <div class="row">
           <el-button size="small" :disabled="!store.hasImage || store.busy" @click="store.selectAll()">
@@ -273,54 +290,70 @@ async function applyTransparent(): Promise<void> {
         </el-button>
         <div v-if="store.regions.length > 0" class="region-list">
           <div v-for="region in store.regions" :key="region.id" class="region-row">
-            <span
-              class="region-color-dot"
-              :style="{ background: store.regionColorOf(region.id) }"
-              title="按住工具栏「显示区域」时该区域的显示颜色"
-            />
             <img
               v-if="regionThumbUrl(region)"
               :src="regionThumbUrl(region)!"
               class="region-thumb"
               alt=""
+              title="按住预览该区域"
+              @pointerdown="startRegionPreview(region, $event)"
+              @pointerup="endRegionPreview()"
+              @pointercancel="endRegionPreview()"
+              @lostpointercapture="endRegionPreview()"
             />
             <div v-else class="region-thumb placeholder" />
-            <div class="region-meta">
-              <span class="region-name">{{ region.name }}</span>
-              <span class="region-lock-state">
-                {{ region.locked ? '已固定：编辑时自动并集' : '未固定' }}
-              </span>
+            <div class="region-info">
+              <el-tooltip :content="region.name" placement="top" :show-after="300">
+                <span class="region-name">
+                  <span
+                    class="region-color-dot"
+                    :style="{ background: store.regionColorOf(region.id) }"
+                    title="区域配色（按住工具栏「显示区域」可见）"
+                  />
+                  <span class="region-name-text">{{ region.name }}</span>
+                </span>
+              </el-tooltip>
+              <span class="region-lock-state">{{ region.locked ? '已固定' : '未固定' }}</span>
             </div>
             <div class="region-actions">
-              <el-button
-                size="small"
-                text
-                :type="region.locked ? 'warning' : 'default'"
-                :disabled="store.busy"
-                @click="store.toggleRegionLock(region.id)"
-              >
-                {{ region.locked ? '解锁' : '固定' }}
-              </el-button>
-              <el-button size="small" text :disabled="store.busy" @click="store.applyRegion(region.id, 'add')">
-                并集
-              </el-button>
-              <el-button
-                size="small"
-                text
-                :disabled="store.busy"
-                @click="store.applyRegion(region.id, 'intersect')"
-              >
-                交集
-              </el-button>
-              <el-button
-                size="small"
-                text
-                type="danger"
-                :disabled="store.busy"
-                @click="store.deleteRegion(region.id)"
-              >
-                删除
-              </el-button>
+              <div class="region-action-row">
+                <el-button
+                  size="small"
+                  text
+                  :type="region.locked ? 'warning' : 'default'"
+                  :disabled="store.busy"
+                  @click="store.toggleRegionLock(region.id)"
+                >
+                  {{ region.locked ? '解锁' : '固定' }}
+                </el-button>
+                <el-button
+                  size="small"
+                  text
+                  type="danger"
+                  :disabled="store.busy"
+                  @click="store.deleteRegion(region.id)"
+                >
+                  删除
+                </el-button>
+              </div>
+              <div class="region-action-row">
+                <el-button
+                  size="small"
+                  text
+                  :disabled="store.busy"
+                  @click="store.applyRegion(region.id, 'add')"
+                >
+                  并集
+                </el-button>
+                <el-button
+                  size="small"
+                  text
+                  :disabled="store.busy"
+                  @click="store.applyRegion(region.id, 'intersect')"
+                >
+                  交集
+                </el-button>
+              </div>
             </div>
           </div>
         </div>
