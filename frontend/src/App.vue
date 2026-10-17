@@ -44,12 +44,13 @@ function onGlobalKey(event: KeyboardEvent): void {
   }
   const ctrl = event.ctrlKey || event.metaKey;
   const key = event.key.toLowerCase();
+  // Ctrl+Z / Ctrl+Y：撤销 / 重做「操作」（选区、图片编辑、区域管理；版本树用工具栏按钮）
   if (ctrl && key === 'z' && !event.shiftKey) {
     event.preventDefault();
-    void store.undo();
+    void store.undoOperation();
   } else if (ctrl && (key === 'y' || (key === 'z' && event.shiftKey))) {
     event.preventDefault();
-    void store.redo();
+    void store.redoOperation();
   } else if (ctrl && key === 'o') {
     event.preventDefault();
     store.openLibrary();

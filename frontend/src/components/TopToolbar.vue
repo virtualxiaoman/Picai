@@ -9,6 +9,7 @@ import {
   FullScreen,
   Grid,
   Hide,
+  List,
   Picture,
   RefreshLeft,
   RefreshRight,
@@ -19,10 +20,12 @@ import { useEditorStore } from '../stores/editor';
 import ExportDialog from './ExportDialog.vue';
 import HistoryPanel from './HistoryPanel.vue';
 import ImageLibraryDialog from './ImageLibraryDialog.vue';
+import OperationHistoryPanel from './OperationHistoryPanel.vue';
 
 const store = useEditorStore();
 const exportVisible = ref(false);
 const historyVisible = ref(false);
+const opHistoryVisible = ref(false);
 
 const zoomPercent = computed(() => Math.round(store.viewScale * 100));
 
@@ -89,7 +92,7 @@ function endHold(kind: 'original' | 'regions'): void {
     <div class="divider" />
 
     <div class="group">
-      <el-tooltip content="撤销 (Ctrl+Z)" placement="bottom">
+      <el-tooltip content="历史版本：退回到父版本（版本树导航；Ctrl+Z 用于撤销操作）" placement="bottom">
         <el-button
           :icon="RefreshLeft"
           circle
@@ -110,7 +113,16 @@ function endHold(kind: 'original' | 'regions'): void {
           <span class="history-pos">{{ historyPosition }}</span>
         </el-button>
       </el-tooltip>
-      <el-tooltip content="重做 (Ctrl+Shift+Z)" placement="bottom">
+      <el-tooltip content="操作历史：查看并跳转 Ctrl+Z / Ctrl+Y 的每一步操作" placement="bottom">
+        <el-button
+          :icon="List"
+          circle
+          plain
+          :disabled="!store.hasImage"
+          @click="opHistoryVisible = true"
+        />
+      </el-tooltip>
+      <el-tooltip content="历史版本：前进到下一个版本（版本树导航；Ctrl+Y 用于重做操作）" placement="bottom">
         <el-button
           :icon="RefreshRight"
           circle
@@ -198,6 +210,16 @@ function endHold(kind: 'original' | 'regions'): void {
       append-to-body
     >
       <HistoryPanel />
+    </el-dialog>
+
+    <el-dialog
+      v-model="opHistoryVisible"
+      title="操作历史"
+      width="560px"
+      top="6vh"
+      append-to-body
+    >
+      <OperationHistoryPanel />
     </el-dialog>
   </header>
 </template>

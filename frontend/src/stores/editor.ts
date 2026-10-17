@@ -10,6 +10,7 @@ import { ElMessage } from 'element-plus';
 import { Viewport } from '../core/viewport';
 import { SelectionManager, type BrushShape } from '../core/SelectionManager';
 import { HistoryManager, type HistoryNode } from '../core/HistoryManager';
+import { OperationHistory, type OperationEntry, type OperationKind } from '../core/OperationHistory';
 import { MaskRenderer } from '../core/MaskRenderer';
 import { EditOperations } from '../core/EditOperations';
 import { buildExportFilename, downloadBlob, encodeCanvas } from '../core/ExportService';
@@ -171,6 +172,29 @@ export const useEditorStore = defineStore('editor', () => {
   const maskVersion = ref(0);
   const hasSelection = ref(false);
   const regions = shallowRef<Region[]>([]);
+  /** 统一操作历史（Ctrl+Z/Y 专用；与图片版本树导航相互独立） */
+  const operationHistory = markRaw(new OperationHistory());
+  /** 与操作栈当前游标对应的蒙版状态（null = 空选区）；用于记录选区操作的前后快照 */
+  let lastMaskState: Uint8ClampedArray | null = null;
+  /** 操作历史面板展示用（轻量列表，不含蒙版快照） */
+  const operationsView = ref<Array<{ label: string; kind: OperationKind }>>([]);
+  const operationCursor = ref(-1);
+
+  function syncOperationHistory(): void {
+    operationsView.value = operationHistory.list();
+    operationCursor.value = operationHistory.depth.undo - 1;
+  }
+
+  function pushOperation(entry: Omit<OperationEntry, 'bytes'>): void {
+    operationHistory.push(entry);
+    syncOperationHistory();
+  }
+
+  function resetOperationHistory(): void {
+    operationHistory.reset();
+    lastMaskState = null;
+    syncOperationHistory();
+  }
 
   // ---------- 历史 ----------
   let history: HistoryManager | null = null;
@@ -472,6 +496,7 @@ export const useEditorStore = defineStore('editor', () => {
     history = null;
     regions.value = [];
     hasSelection.value = false;
+    resetOperationHistory();
     currentHistoryId.value = -1;
     canUndo.value = false;
     canRedo.value = false;
@@ -526,6 +551,7 @@ export const useEditorStore = defineStore('editor', () => {
     updateHistoryFlags();
     maskVersion.value = maskManager?.version ?? 0;
     hasSelection.value = false;
+    resetOperationHistory(); // 操作撤销历史随图片切换重置
     showOriginal.value = false;
     imageVersion.value++;
     historyVersion.value++;
@@ -887,28 +913,133 @@ export const useEditorStore = defineStore('editor', () => {
     hasSelection.value = maskManager ? !maskManager.isEmpty() : false;
   }
 
+  /** 选区操作完成后记录到统一操作历史 */
+  function recordSelectionOp(label: string): void {
+    if (!maskManager) return;
+    const after = maskManager.getGrayMask();
+    pushOperation({ kind: 'selection', label, before: lastMaskState, after });
+    lastMaskState = after;
+  }
+
+  /** 图片编辑操作完成后记录（撤销时移动版本树指针到父版本） */
+  function recordEditOp(label: string, node: HistoryNode): void {
+    pushOperation({ kind: 'edit', label, nodeId: node.id });
+  }
+
+  /** Ctrl+Z：撤销上一个操作（选区变化 / 图片编辑 / 区域管理） */
+  async function undoOperation(): Promise<void> {
+    if (busy.value || !history || !maskManager) return;
+    const entry = operationHistory.undo();
+    if (!entry) return;
+    await applyOperation(entry, false);
+    syncOperationHistory();
+  }
+
+  /** Ctrl+Y / Ctrl+Shift+Z：重做上一个被撤销的操作 */
+  async function redoOperation(): Promise<void> {
+    if (busy.value || !history || !maskManager) return;
+    const entry = operationHistory.redo();
+    if (!entry) return;
+    await applyOperation(entry, true);
+    syncOperationHistory();
+  }
+
+  /** 操作历史面板：跳转到任意步骤（-1 = 初始状态），内部逐步应用撤销/重做 */
+  async function jumpToOperation(targetIndex: number): Promise<void> {
+    if (busy.value || !history || !maskManager) return;
+    let cursor = operationHistory.depth.undo - 1;
+    while (cursor > targetIndex) {
+      const entry = operationHistory.undo();
+      if (!entry) break;
+      await applyOperation(entry, false);
+      cursor--;
+    }
+    while (cursor < targetIndex) {
+      const entry = operationHistory.redo();
+      if (!entry) break;
+      await applyOperation(entry, true);
+      cursor++;
+    }
+    syncOperationHistory();
+  }
+
+  /** 应用/撤销一条操作记录（redo=false 表示撤销） */
+  async function applyOperation(entry: OperationEntry, redo: boolean): Promise<void> {
+    if (entry.kind === 'selection') {
+      if (!maskManager) return;
+      const state = (redo ? entry.after : entry.before) ?? null;
+      if (state) maskManager.setFromGray(state);
+      else maskManager.clearAll();
+      lastMaskState = state;
+      pushMaskVersion();
+      refreshSelectionState();
+      return;
+    }
+    if (entry.kind === 'edit') {
+      if (!history || entry.nodeId == null) return;
+      const node = history.getNode(entry.nodeId);
+      if (!node) return;
+      if (!redo) {
+        // 撤销：当前应停在该节点上，指针回到父版本
+        if (history.currentId !== node.id || node.parentId == null) return;
+        history.jumpTo(node.parentId);
+        const parent = history.current;
+        if (parent) await loadNode(parent);
+      } else {
+        // 重做：指针回到该节点
+        if (history.currentId !== node.parentId) return;
+        history.jumpTo(node.id);
+        await loadNode(node);
+      }
+      return;
+    }
+    // 区域管理操作（仅元数据，不影响图片与蒙版）
+    const currentNode = history?.current;
+    if (!currentNode) return;
+    if (entry.kind === 'region_save' || entry.kind === 'region_delete') {
+      const addBack = entry.kind === 'region_save' ? redo : !redo;
+      const has = (currentNode.regionIds ?? []).includes(entry.regionId!);
+      if (addBack && !has) {
+        currentNode.regionIds = [...(currentNode.regionIds ?? []), entry.regionId!];
+      } else if (!addBack && has) {
+        currentNode.regionIds = (currentNode.regionIds ?? []).filter((id) => id !== entry.regionId);
+      }
+      regions.value = regionsForNode(currentNode);
+    } else if (entry.kind === 'region_lock') {
+      const region = regions.value.find((r) => r.id === entry.regionId);
+      if (!region) return;
+      region.locked = redo ? !entry.lockedBefore : !!entry.lockedBefore;
+      regions.value = [...regions.value];
+    }
+    bumpData();
+  }
+
   function selectAll(): void {
     maskManager?.selectAll();
     pushMaskVersion();
     refreshSelectionState();
+    recordSelectionOp('全选');
   }
 
   function invertSelection(): void {
     maskManager?.invert();
     pushMaskVersion();
     refreshSelectionState();
+    recordSelectionOp('反选');
   }
 
   function clearSelection(): void {
     maskManager?.clearAll();
     pushMaskVersion();
     refreshSelectionState();
+    recordSelectionOp('清空选区');
   }
 
   function endBrushStroke(): void {
     maskManager?.endStroke();
     pushMaskVersion();
     refreshSelectionState();
+    recordSelectionOp('画笔选区');
   }
 
   function commitMarquee(
@@ -919,6 +1050,7 @@ export const useEditorStore = defineStore('editor', () => {
     maskManager?.marquee(shape, rect, mode);
     pushMaskVersion();
     refreshSelectionState();
+    recordSelectionOp('几何选区');
   }
 
   // ---------- 临时查看（按住显示，松开恢复；不改变任何编辑状态） ----------
@@ -935,19 +1067,40 @@ export const useEditorStore = defineStore('editor', () => {
     showRegions.value = on && hasImage.value && regions.value.length > 0;
   }
 
+  /** 按住区域缩略图时，在画布区域单独预览该区域 */
+  const regionPreviewId = ref<string | null>(null);
+
+  function pressRegionPreview(regionId: string | null): void {
+    regionPreviewId.value =
+      regionId && hasImage.value && regions.value.some((r) => r.id === regionId)
+        ? regionId
+        : null;
+  }
+
+  /** 区域配色：参考 Apple 系统色，色相间隔尽量拉开，保证同图内区分度 */
   const REGION_PALETTE = [
-    '#00e5ff',
-    '#ff5a1f',
-    '#22c55e',
-    '#eab308',
-    '#a855f7',
-    '#ef4444',
-    '#3b82f6',
-    '#ec4899',
+    '#FF3B30', // 红
+    '#FF9500', // 橙
+    '#FFD60A', // 黄
+    '#30D158', // 绿
+    '#00C7BE', // 青绿
+    '#64D2FF', // 天蓝
+    '#0A84FF', // 蓝
+    '#5E5CE6', // 靛蓝
+    '#BF5AF2', // 紫
+    '#FF375F', // 玫红
   ];
 
-  /** 区域配色（按 id 哈希，稳定且无需存储） */
+  /**
+   * 区域配色：按图片级注册表的创建顺序分配（同图不同区域颜色不同、跨会话稳定）；
+   * 找不到时回退为 id 哈希。
+   */
   function regionColorOf(regionId: string): string {
+    const registry = activeImage.value?.regionRegistry;
+    if (registry) {
+      const index = registry.findIndex((r) => r.id === regionId);
+      if (index >= 0) return REGION_PALETTE[index % REGION_PALETTE.length];
+    }
     let hash = 0;
     for (let i = 0; i < regionId.length; i++) hash = (hash * 31 + regionId.charCodeAt(i)) >>> 0;
     return REGION_PALETTE[hash % REGION_PALETTE.length];
@@ -955,12 +1108,18 @@ export const useEditorStore = defineStore('editor', () => {
 
   let regionsViewCache: { key: string; canvas: HTMLCanvasElement } | null = null;
 
-  /** 所有区域的可视化画布（不同区域不同颜色，固定的区域颜色更实；按需构建并缓存） */
-  function getRegionsViewCanvas(): HTMLCanvasElement | null {
-    if (!hasImage.value || regions.value.length === 0) return null;
+  /**
+   * 区域可视化画布（不同区域不同颜色，固定的区域颜色更实；按需构建并缓存）。
+   * 传入 onlyRegionId 时只渲染该区域（按住缩略图预览用）。
+   */
+  function getRegionsViewCanvas(onlyRegionId?: string | null): HTMLCanvasElement | null {
+    const list = onlyRegionId
+      ? regions.value.filter((r) => r.id === onlyRegionId)
+      : regions.value;
+    if (!hasImage.value || list.length === 0) return null;
     const w = imageWidth.value;
     const h = imageHeight.value;
-    const key = `${activeImageId.value}:${regions.value
+    const key = `${activeImageId.value}:${onlyRegionId ?? 'all'}:${list
       .map((r) => `${r.id}${r.locked ? 'L' : ''}`)
       .join(',')}`;
     if (regionsViewCache && regionsViewCache.key === key) return regionsViewCache.canvas;
@@ -972,14 +1131,15 @@ export const useEditorStore = defineStore('editor', () => {
     layer.width = w;
     layer.height = h;
     const lctx = layer.getContext('2d')!;
-    for (const region of regions.value) {
+    for (const region of list) {
       lctx.globalCompositeOperation = 'source-over';
       lctx.clearRect(0, 0, w, h);
       lctx.putImageData(new ImageData(grayToRgba(region.gray), w, h), 0, 0);
       lctx.globalCompositeOperation = 'source-in';
       lctx.fillStyle = regionColorOf(region.id);
       lctx.fillRect(0, 0, w, h);
-      octx.globalAlpha = region.locked ? 0.9 : 0.6;
+      // 单区域预览时更实一些
+      octx.globalAlpha = onlyRegionId ? 0.9 : region.locked ? 0.9 : 0.6;
       octx.drawImage(layer, 0, 0);
     }
     octx.globalAlpha = 1;
@@ -1009,6 +1169,7 @@ export const useEditorStore = defineStore('editor', () => {
       const node = history?.current;
       if (node) node.regionIds = [...(node.regionIds ?? []), region.id];
       regions.value = node ? regionsForNode(node) : [region];
+      pushOperation({ kind: 'region_save', label: `保存区域「${trimmed}」`, regionId: region.id });
       bumpData();
       ElMessage.success(`已保存区域「${trimmed}」（随当前历史版本保存）`);
     } catch (err) {
@@ -1026,6 +1187,7 @@ export const useEditorStore = defineStore('editor', () => {
     maskManager.combineGray(region.gray, mode);
     pushMaskVersion();
     refreshSelectionState();
+    recordSelectionOp(`合并区域「${region.name}」`);
     ElMessage.success(`区域「${region.name}」已${mode === 'add' ? '并集' : '交集'}到当前选区`);
   }
 
@@ -1033,16 +1195,19 @@ export const useEditorStore = defineStore('editor', () => {
     const region = regions.value.find((r) => r.id === regionId);
     if (!region) return;
     // 锁定状态存于共享区域对象上（跨版本共享同一把"锁"）
+    const lockedBefore = region.locked;
     region.locked = !region.locked;
     regions.value = [...regions.value]; // shallowRef 下显式触发更新
+    pushOperation({ kind: 'region_lock', label: region.locked ? `固定区域「${region.name}」` : `解锁区域「${region.name}」`, regionId, lockedBefore });
     bumpData();
   }
 
   function deleteRegion(regionId: string): void {
     // 仅从当前历史版本移除；其他版本（若仍引用该区域）不受影响
-    const node = history?.current;
-    if (node) node.regionIds = (node.regionIds ?? []).filter((id) => id !== regionId);
+    const opNode = history?.current;
+    if (opNode) opNode.regionIds = (opNode.regionIds ?? []).filter((id) => id !== regionId);
     regions.value = regions.value.filter((r) => r.id !== regionId);
+    pushOperation({ kind: 'region_delete', label: '删除区域', regionId });
     bumpData();
   }
 
@@ -1087,7 +1252,8 @@ export const useEditorStore = defineStore('editor', () => {
 
       const snap = await canvasToBlob(editedCanvas, 'image/png');
       const thumb = await makeThumbnail(editedCanvas, w, h);
-      history.addEdit({ type: op.type, params: { ...op } }, snap, thumb);
+      const editNode = history.addEdit({ type: op.type, params: { ...op } }, snap, thumb);
+      recordEditOp(label, editNode);
       const img = activeImage.value;
       if (img) {
         img.currentId = history.currentId;
@@ -1151,18 +1317,22 @@ export const useEditorStore = defineStore('editor', () => {
 
   async function undo(): Promise<void> {
     if (!history?.canUndo() || busy.value) return;
+    // 手动版本导航后时间线改变：重置操作撤销栈
+    resetOperationHistory();
     const node = history.undo();
     if (node) await loadNode(node);
   }
 
   async function redo(childId?: number): Promise<void> {
     if (!history || busy.value) return;
+    resetOperationHistory();
     const node = history.redo(childId);
     if (node) await loadNode(node);
   }
 
   async function jumpToHistory(id: number): Promise<void> {
     if (!history || busy.value || id === history.currentId) return;
+    resetOperationHistory();
     const node = history.jumpTo(id);
     if (node) await loadNode(node);
   }
@@ -1222,6 +1392,7 @@ export const useEditorStore = defineStore('editor', () => {
     maskManager.setFromGray(gray);
     pushMaskVersion();
     refreshSelectionState();
+    recordSelectionOp('AI 蒙版');
   }
 
   function pollTask(taskId: string, label: string): Promise<void> {
@@ -1361,6 +1532,7 @@ export const useEditorStore = defineStore('editor', () => {
       maskManager.combineGray(gray, mode);
       pushMaskVersion();
       refreshSelectionState();
+      recordSelectionOp('魔棒选区');
     } catch (err) {
       ElMessage.error(`颜色选择失败：${err instanceof Error ? err.message : String(err)}`);
     } finally {
@@ -1385,6 +1557,7 @@ export const useEditorStore = defineStore('editor', () => {
       maskManager.setFromGray(out);
       pushMaskVersion();
       refreshSelectionState();
+      recordSelectionOp(label);
     } catch (err) {
       ElMessage.error(`${label}失败：${err instanceof Error ? err.message : String(err)}`);
     } finally {
@@ -1451,11 +1624,12 @@ export const useEditorStore = defineStore('editor', () => {
         imageVersion.value++;
         const snap = await canvasToBlob(canvas, 'image/png');
         const thumb = await makeThumbnail(canvas, w, h);
-        history!.addEdit(
+        const fillNode = history!.addEdit(
           { type: 'neighborhood_fill', params: { radius: inpaintRadius.value } },
           snap,
           thumb,
         );
+        recordEditOp('邻域渐变填充', fillNode);
         const img = activeImage.value;
         if (img) {
           img.currentId = history!.currentId;
@@ -1727,7 +1901,7 @@ export const useEditorStore = defineStore('editor', () => {
       imageVersion.value++;
       const snap = await canvasToBlob(editedCanvas, 'image/png');
       const thumb = await makeThumbnail(editedCanvas, w, h);
-      history.addEdit(
+      const insertNode = history.addEdit(
         {
           type: 'insert_image',
           params: {
@@ -1741,6 +1915,7 @@ export const useEditorStore = defineStore('editor', () => {
         snap,
         thumb,
       );
+      recordEditOp('插入图片', insertNode);
       const img = activeImage.value;
       if (img) {
         img.currentId = history.currentId;
@@ -1793,7 +1968,8 @@ export const useEditorStore = defineStore('editor', () => {
           originNote: img.originNote,
           createdAt: img.createdAt,
           original: blobName.original(img.id),
-          thumb: img.thumbBlob ? blobName.imageThumb(img.id) : null,
+          // 磁盘加载的条目只有 thumbUrl（无本地 Blob），引用仍需保留，否则保存时会被当作孤儿清理
+          thumb: img.thumbBlob || img.thumbUrl ? blobName.imageThumb(img.id) : null,
           nodes: [],
           regions: [],
         };
@@ -1810,7 +1986,7 @@ export const useEditorStore = defineStore('editor', () => {
               label: node.label,
               regionIds: [...(node.regionIds ?? [])],
               snapshot: blobName.snapshot(img.id, node.id),
-              thumb: node.thumbBlob ? blobName.nodeThumb(img.id, node.id) : null,
+              thumb: node.thumbBlob || node.thumbUrl ? blobName.nodeThumb(img.id, node.id) : null,
             };
             needUpload(manifestNode.snapshot, node.imageBlob);
             if (manifestNode.thumb) needUpload(manifestNode.thumb, node.thumbBlob);
@@ -1835,7 +2011,7 @@ export const useEditorStore = defineStore('editor', () => {
               locked: region.locked,
               order: order++,
               gray: blobName.regionGray(region.id),
-              thumb: region.thumbBlob ? blobName.regionThumb(region.id) : null,
+              thumb: region.thumbBlob || region.thumbUrl ? blobName.regionThumb(region.id) : null,
             };
             referenced.add(manifestRegion.gray);
             if (!serverBlobNames.has(manifestRegion.gray)) {
@@ -1926,6 +2102,10 @@ export const useEditorStore = defineStore('editor', () => {
         for (const row of rows) {
           const nodes = await legacy.loadNodes(row.id);
           const regions = await legacy.loadRegions(row.id);
+          // 旧数据兼容：节点缺少 regionIds 字段时视为空集，当前版本稍后继承全部区域
+          const legacyCurrentNode = nodes.find((n) => n.id === row.currentHistoryId);
+          const currentLacksRegions =
+            !!legacyCurrentNode && !Array.isArray(legacyCurrentNode.regionIds);
           const manifestImage: ManifestImage = {
             id: row.id,
             name: row.name,
@@ -1976,6 +2156,10 @@ export const useEditorStore = defineStore('editor', () => {
             }
             manifestImage.regions.push(manifestRegion);
           }
+          if (currentLacksRegions && manifestImage.regions.length > 0) {
+            const targetNode = manifestImage.nodes.find((n) => n.id === row.currentHistoryId);
+            if (targetNode) targetNode.regionIds = manifestImage.regions.map((r) => r.id);
+          }
           manifest.images.push(manifestImage);
         }
 
@@ -2025,7 +2209,175 @@ export const useEditorStore = defineStore('editor', () => {
     } catch {
       /* 后端未启动等情况：跳过迁移，不影响编辑 */
     }
+    try {
+      const repaired = await repairMissingThumbs();
+      if (repaired > 0) ElMessage.success(`已修复 ${repaired} 个历史缩略图`);
+    } catch {
+      /* 后端未启动等情况：跳过修复 */
+    }
+    try {
+      const relinked = await repairRegionLinks();
+      if (relinked > 0) ElMessage.success(`已恢复 ${relinked} 个区域的版本归属`);
+    } catch {
+      /* 后端未启动等情况：跳过修复 */
+    }
     await tryRestoreProject();
+  }
+
+  /**
+   * 修复清单中缺失的缩略图引用（曾有版本在保存时丢失 thumb 引用，导致文件被清理）。
+   * 优先从浏览器旧存储取缩略图，取不到则从快照/原图/蒙版重新生成。
+   */
+  async function repairMissingThumbs(): Promise<number> {
+    const serverProjects = await projectStorage.listProjects();
+    if (serverProjects.length === 0) return 0;
+    let legacy: LegacyIndexedDbStorage | null = null;
+    let legacyProjects: Awaited<ReturnType<LegacyIndexedDbStorage['listProjects']>> = [];
+    try {
+      legacy = new LegacyIndexedDbStorage();
+      legacyProjects = await legacy.listProjects();
+    } catch {
+      legacy = null;
+    }
+    let repaired = 0;
+    for (const project of serverProjects) {
+      if (!project.folder) continue;
+      let manifest: ProjectManifest;
+      try {
+        manifest = await projectStorage.loadManifestRaw(project.folder);
+      } catch {
+        continue;
+      }
+      const missing = manifest.images.some(
+        (image) =>
+          !image.thumb || image.nodes.some((n) => !n.thumb) || image.regions.some((r) => !r.thumb),
+      );
+      if (!missing) continue;
+      busy.value = true;
+      busyText.value = `修复「${project.name}」的历史缩略图…`;
+      try {
+        const files: File[] = [];
+        const legacyProject = legacy
+          ? legacyProjects.find((p) => p.name === project.name)
+          : undefined;
+        const legacyImages = legacyProject ? await legacy!.listImages(legacyProject.id) : [];
+        for (const image of manifest.images) {
+          const legacyRow = legacyImages.find((r) => r.id === image.id);
+          // 图片缩略图
+          if (!image.thumb) {
+            const name = blobName.imageThumb(image.id);
+            let blob: Blob | null = legacyRow?.thumbBlob ?? null;
+            if (!blob) {
+              const original = await projectStorage.fetchBlob(
+                projectStorage.blobUrl(project.folder, image.original),
+              );
+              blob = await makeThumbnail(
+                await createImageBitmap(original),
+                image.width,
+                image.height,
+              );
+            }
+            if (blob) {
+              files.push(new File([blob], name));
+              image.thumb = name;
+              repaired++;
+            }
+          }
+          // 历史节点缩略图
+          const legacyNodes = legacyRow ? await legacy!.loadNodes(image.id) : [];
+          for (const node of image.nodes) {
+            if (node.thumb) continue;
+            const name = blobName.nodeThumb(image.id, node.id);
+            let blob: Blob | null =
+              legacyNodes.find((n) => n.id === node.id)?.thumbBlob ?? null;
+            if (!blob) {
+              const snapshot = await projectStorage.fetchBlob(
+                projectStorage.blobUrl(project.folder, node.snapshot),
+              );
+              blob = await makeThumbnail(
+                await createImageBitmap(snapshot),
+                image.width,
+                image.height,
+              );
+            }
+            if (blob) {
+              files.push(new File([blob], name));
+              node.thumb = name;
+              repaired++;
+            }
+          }
+          // 区域缩略图
+          const legacyRegions = legacyRow ? await legacy!.loadRegions(image.id) : [];
+          for (const region of image.regions) {
+            if (region.thumb) continue;
+            const name = blobName.regionThumb(region.id);
+            let blob: Blob | null =
+              legacyRegions.find((r) => r.id === region.id)?.thumbBlob ?? null;
+            if (!blob) {
+              const grayBlob = await projectStorage.fetchBlob(
+                projectStorage.blobUrl(project.folder, region.gray),
+              );
+              blob = await grayToThumbBlob(await decodeGrayBlob(grayBlob), image.width, image.height);
+            }
+            if (blob) {
+              files.push(new File([blob], name));
+              region.thumb = name;
+              repaired++;
+            }
+          }
+        }
+        if (files.length > 0) {
+          await projectStorage.saveProject(project.folder, manifest, files);
+        }
+      } catch (err) {
+        ElMessage.warning(
+          `「${project.name}」缩略图修复未完成：${err instanceof Error ? err.message : String(err)}（下次启动会重试）`,
+        );
+      } finally {
+        busy.value = false;
+        busyText.value = '';
+      }
+    }
+    return repaired;
+  }
+
+  /**
+   * 修复缺失的区域-版本归属（旧数据迁移时可能丢失）：
+   * 若某图片存在区域，但没有任何历史版本记录归属，则把全部区域归到当前版本。
+   */
+  async function repairRegionLinks(): Promise<number> {
+    const serverProjects = await projectStorage.listProjects();
+    let fixed = 0;
+    for (const project of serverProjects) {
+      if (!project.folder) continue;
+      let manifest: ProjectManifest;
+      try {
+        manifest = await projectStorage.loadManifestRaw(project.folder);
+      } catch {
+        continue;
+      }
+      let changed = false;
+      for (const image of manifest.images) {
+        if (image.regions.length === 0) continue;
+        const hasAnyLink = image.nodes.some((n) => (n.regionIds ?? []).length > 0);
+        if (hasAnyLink) continue;
+        const currentNode = image.nodes.find((n) => n.id === image.currentHistoryId);
+        if (!currentNode) continue;
+        currentNode.regionIds = image.regions.map((region) => region.id);
+        fixed += image.regions.length;
+        changed = true;
+      }
+      if (changed) {
+        try {
+          await projectStorage.saveProject(project.folder, manifest, []);
+        } catch (err) {
+          ElMessage.warning(
+            `「${project.name}」区域归属修复写入失败：${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    }
+    return fixed;
   }
 
   async function tryRestoreProject(): Promise<boolean> {
@@ -2175,6 +2527,8 @@ export const useEditorStore = defineStore('editor', () => {
     showRegions,
     pressOriginal,
     pressRegions,
+    regionPreviewId,
+    pressRegionPreview,
     regionColorOf,
     getRegionsViewCanvas,
     magicWandAt,
@@ -2222,6 +2576,11 @@ export const useEditorStore = defineStore('editor', () => {
     selectAll,
     invertSelection,
     clearSelection,
+    undoOperation,
+    redoOperation,
+    operationsView,
+    operationCursor,
+    jumpToOperation,
     startBrushStroke,
     brushStrokeTo,
     endBrushStroke,
