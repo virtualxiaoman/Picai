@@ -5,7 +5,7 @@
 
 import { defineStore } from 'pinia';
 import { computed, markRaw, ref, shallowRef, watch } from 'vue';
-import { ElMessage } from 'element-plus';
+import { ElMessage, ElMessageBox } from 'element-plus';
 
 import { Viewport } from '../core/viewport';
 import { SelectionManager, type BrushShape } from '../core/SelectionManager';
@@ -44,6 +44,7 @@ import {
   requestPointSegment,
   requestRemoveBackground,
   requestTextSegment,
+  requestAiRepair,
   type TaskState,
 } from '../api/client';
 import type {
@@ -69,6 +70,44 @@ export interface AiBox {
   y: number;
   width: number;
   height: number;
+}
+
+/** AI 修复会话状态（生成 -> 画布切换查看 -> 合并/调整区域） */
+export interface AiRepairState {
+  /** 当前激活的候选图 id（对应图片的 aiCandidates） */
+  candidateId: string;
+  prompt: string;
+  /** AI 图（已按原图尺寸缩放，用于合成与差异计算） */
+  aiCanvas: HTMLCanvasElement;
+  /** 差异区域可视化画布（深底 + 橙色标记，用于“差异区域”视图） */
+  diffCanvas: HTMLCanvasElement;
+  /** 原图与 AI 图的差异蒙版（用于自动选区/恢复差异区域） */
+  diffGray: Uint8ClampedArray;
+  /** AI 返回的原始分辨率 */
+  sourceW: number;
+  sourceH: number;
+  /** 是否发生分辨率缩放（用于界面提示） */
+  scaled: boolean;
+  phase: 'compare' | 'adjust';
+}
+
+/** 保留的 AI 候选图（随项目保存，可随时切换对比/应用） */
+export interface AiCandidate {
+  id: string;
+  source: 'generated' | 'uploaded';
+  /** 列表显示名（生成用描述，上传用文件名） */
+  name: string;
+  prompt: string;
+  createdAt: number;
+  /** 原始尺寸（上传/AI 返回时）；保存的是按原图尺寸缩放后的图 */
+  sourceW: number;
+  sourceH: number;
+  /** 已按原图尺寸缩放的 PNG（本地新建时存在；磁盘加载后按需拉取） */
+  blob: Blob | null;
+  /** 磁盘存储 URL */
+  url: string | null;
+  thumbBlob: Blob | null;
+  thumbUrl: string | null;
 }
 
 /** 保存的选区区域（可固定，编辑时自动并集） */
@@ -105,6 +144,8 @@ export interface ProjectImage {
    * 区域对象本身不被修改（锁定状态除外），因此多版本共享不增加存储与内存开销。
    */
   regionRegistry: Region[] | null;
+  /** 保留的 AI 候选图（生成/上传），随项目保存 */
+  aiCandidates: AiCandidate[];
 }
 
 /** 插入图片（画布合成）状态 */
@@ -223,6 +264,18 @@ export const useEditorStore = defineStore('editor', () => {
   const aiTask = ref<{ id: string; message: string; progress: number } | null>(null);
   const aiPoints = ref<AiPoint[]>([]);
   const aiBox = ref<AiBox | null>(null);
+  // AI 修复
+  const aiRepair = shallowRef<AiRepairState | null>(null);
+  /** 画布展示视图：原图 / AI 图 / 差异区域 */
+  const aiView = ref<'original' | 'ai' | 'diff'>('original');
+  // projectImages 为 shallowRef，候选图增删通过版本号触发界面刷新
+  const aiCandidateVersion = ref(0);
+  const aiCandidates = computed<AiCandidate[]>(() => {
+    void aiCandidateVersion.value;
+    return activeImage.value?.aiCandidates ?? [];
+  });
+  let aiCandidateLoadToken = 0;
+  let aiPrivacyConfirmed = false;
   let pollTimer: number | null = null;
 
   // ---------- 插入（画布合成） ----------
@@ -235,6 +288,7 @@ export const useEditorStore = defineStore('editor', () => {
   const toolIds: ToolId[] = [
     'brush-circle',
     'brush-square',
+    'brush-eraser',
     'marquee-rect',
     'marquee-ellipse',
     'ai-remove-bg',
@@ -273,6 +327,11 @@ export const useEditorStore = defineStore('editor', () => {
   );
   const exportQuality = ref(readPrefNumber(prefs, 'exportQuality', 92, 50, 100));
   const exportBackground = ref(readPrefString(prefs, 'exportBackground', '#ffffff'));
+
+  // 抚平褶皱（跨项目记忆）
+  const flattenStrength = ref(readPrefNumber(prefs, 'flattenStrength', 70, 0, 100));
+  const flattenScale = ref(readPrefNumber(prefs, 'flattenScale', 80, 5, 300));
+  const flattenTextureKeep = ref(readPrefNumber(prefs, 'flattenTextureKeep', 100, 0, 100));
 
   // 选区显示模式（跨项目记忆）：半透明填色 / 差分（反相，底色相近时也清晰可辨）
   const maskDisplayMode = ref<'fill' | 'difference'>(
@@ -333,6 +392,9 @@ export const useEditorStore = defineStore('editor', () => {
         exportQuality: exportQuality.value,
         exportBackground: exportBackground.value,
         maskDisplayMode: maskDisplayMode.value,
+        flattenStrength: flattenStrength.value,
+        flattenScale: flattenScale.value,
+        flattenTextureKeep: flattenTextureKeep.value,
       });
     }, 300);
   }
@@ -363,6 +425,9 @@ export const useEditorStore = defineStore('editor', () => {
       exportQuality,
       exportBackground,
       maskDisplayMode,
+      flattenStrength,
+      flattenScale,
+      flattenTextureKeep,
     ],
     () => schedulePrefsSave(),
   );
@@ -450,6 +515,19 @@ export const useEditorStore = defineStore('editor', () => {
       currentId: row.currentHistoryId,
       history: null,
       regionRegistry: null,
+      aiCandidates: (row.aiCandidates ?? []).map((c) => ({
+        id: c.id,
+        source: c.source,
+        name: c.name,
+        prompt: c.prompt,
+        createdAt: c.createdAt,
+        sourceW: c.sourceW,
+        sourceH: c.sourceH,
+        blob: null,
+        url: c.imageUrl,
+        thumbBlob: null,
+        thumbUrl: c.thumbUrl,
+      })),
     };
   }
 
@@ -483,6 +561,7 @@ export const useEditorStore = defineStore('editor', () => {
   }
 
   function clearImageState(): void {
+    if (aiRepair.value) closeAiRepair();
     activeImageId.value = null;
     hasImage.value = false;
     imageWidth.value = 0;
@@ -542,6 +621,7 @@ export const useEditorStore = defineStore('editor', () => {
   }
 
   function applyImageState(img: ProjectImage): void {
+    if (aiRepair.value) closeAiRepair();
     activeImageId.value = img.id;
     originalBlob.value = img.originalBlob;
     sourceName.value = img.name;
@@ -722,6 +802,7 @@ export const useEditorStore = defineStore('editor', () => {
       currentId: -1,
       history: null,
       regionRegistry: null,
+      aiCandidates: [],
     };
     const hm = new HistoryManager();
     const root = hm.init(sourceBlob, thumb, rootLabel ?? (originNote ? `导入（${originNote}）` : '原图'));
@@ -1506,6 +1587,327 @@ export const useEditorStore = defineStore('editor', () => {
     }
   }
 
+  // ---------- AI 修复（openlux；图片会上传至云端） ----------
+
+  function closeAiRepair(): void {
+    aiRepair.value = null;
+    aiView.value = 'original';
+    imageVersion.value++;
+  }
+
+  function setAiView(mode: 'original' | 'ai' | 'diff'): void {
+    aiView.value = mode;
+    imageVersion.value++;
+  }
+
+  /** 差异区域可视化画布（深底 + 橙色标记，避免棋盘格背景干扰） */
+  function buildDiffViewCanvas(gray: Uint8ClampedArray, w: number, h: number): HTMLCanvasElement {
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d')!;
+    ctx.fillStyle = '#141416';
+    ctx.fillRect(0, 0, w, h);
+    const layer = document.createElement('canvas');
+    layer.width = w;
+    layer.height = h;
+    const lctx = layer.getContext('2d')!;
+    lctx.putImageData(new ImageData(grayToRgba(gray), w, h), 0, 0);
+    lctx.globalCompositeOperation = 'source-in';
+    lctx.fillStyle = '#ff9f0a';
+    lctx.fillRect(0, 0, w, h);
+    ctx.globalAlpha = 0.7;
+    ctx.drawImage(layer, 0, 0);
+    ctx.globalAlpha = 1;
+    return canvas;
+  }
+
+  /** 把差异蒙版设为当前选区（未选区时自动调用 / 手动恢复差异区域） */
+  function applyDiffRegion(): boolean {
+    const repair = aiRepair.value;
+    if (!repair || !maskManager) return false;
+    if (!repair.diffGray.some((v) => v > 0)) {
+      ElMessage.info('未检测到明显差异：请手动选择要应用 AI 结果的范围');
+      return false;
+    }
+    maskManager.setFromGray(repair.diffGray);
+    pushMaskVersion();
+    refreshSelectionState();
+    recordSelectionOp('AI 差异区域');
+    return true;
+  }
+
+  async function computeDiffRegion(): Promise<boolean> {
+    const ok = applyDiffRegion();
+    if (ok) ElMessage.info('已根据原图与 AI 图的差异生成选区，可继续用画笔/橡皮调整');
+    return ok;
+  }
+
+  /** 激活候选图：按当前编辑结果计算差异并进入对比视图 */
+  async function activateAiCandidate(
+    candidate: AiCandidate,
+    options: { autoRegion?: boolean } = {},
+  ): Promise<void> {
+    const canvas = editedCanvas;
+    if (!canvas) return;
+    const token = ++aiCandidateLoadToken;
+    try {
+      if (!candidate.blob) {
+        if (!candidate.url) throw new Error('该 AI 图的数据缺失');
+        candidate.blob = await projectStorage.fetchBlob(candidate.url);
+      }
+      const bitmap = await createImageBitmap(candidate.blob);
+      const w = imageWidth.value;
+      const h = imageHeight.value;
+      const aiCanvas = document.createElement('canvas');
+      aiCanvas.width = w;
+      aiCanvas.height = h;
+      aiCanvas.getContext('2d')!.drawImage(bitmap, 0, 0, w, h);
+      bitmap.close();
+      if (token !== aiCandidateLoadToken) return;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+      const originalPixels = ctx.getImageData(0, 0, w, h).data;
+      const aiPixels = aiCanvas.getContext('2d')!.getImageData(0, 0, w, h).data;
+      const diffGray = await editOps.diffMask(originalPixels, aiPixels, 12);
+      if (token !== aiCandidateLoadToken) return;
+      aiRepair.value = {
+        candidateId: candidate.id,
+        prompt: candidate.prompt || candidate.name,
+        aiCanvas,
+        diffCanvas: buildDiffViewCanvas(diffGray, w, h),
+        diffGray,
+        sourceW: candidate.sourceW,
+        sourceH: candidate.sourceH,
+        scaled: candidate.sourceW !== w || candidate.sourceH !== h,
+        phase: 'compare',
+      };
+      setAiView('ai');
+      if (options.autoRegion && !hasSelection.value) applyDiffRegion();
+    } catch (err) {
+      if (token !== aiCandidateLoadToken) return;
+      ElMessage.error(`AI 图载入失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** 把 AI 图（生成/上传）归一化到原图尺寸，加入候选历史并激活 */
+  async function addAiCandidateFromBitmap(
+    bitmap: ImageBitmap,
+    meta: { source: AiCandidate['source']; name: string; prompt: string },
+  ): Promise<void> {
+    const img = activeImage.value;
+    const w = imageWidth.value;
+    const h = imageHeight.value;
+    if (!img || !w || !h) {
+      bitmap.close();
+      return;
+    }
+    const scaled = bitmap.width !== w || bitmap.height !== h;
+    const aiCanvas = document.createElement('canvas');
+    aiCanvas.width = w;
+    aiCanvas.height = h;
+    aiCanvas.getContext('2d')!.drawImage(bitmap, 0, 0, w, h);
+    const sourceW = bitmap.width;
+    const sourceH = bitmap.height;
+    bitmap.close();
+    const candidate: AiCandidate = {
+      id: newId('ai'),
+      source: meta.source,
+      name: meta.name,
+      prompt: meta.prompt,
+      createdAt: Date.now(),
+      sourceW,
+      sourceH,
+      blob: await canvasToBlob(aiCanvas, 'image/png'),
+      url: null,
+      thumbBlob: await makeThumbnail(aiCanvas, w, h),
+      thumbUrl: null,
+    };
+    img.aiCandidates = [...(img.aiCandidates ?? []), candidate];
+    aiCandidateVersion.value++;
+    bumpData();
+    if (scaled) {
+      ElMessage.warning(
+        `AI 图分辨率 ${sourceW}×${sourceH} 与原图 ${w}×${h} 不一致，已按原图比例缩放后再进入对比/合并流程`,
+      );
+    }
+    await activateAiCandidate(candidate, { autoRegion: !hasSelection.value });
+  }
+
+  /** 切换查看某个已保存的 AI 候选图 */
+  async function selectAiCandidate(id: string): Promise<void> {
+    if (busy.value) return;
+    const candidate = aiCandidates.value.find((c) => c.id === id);
+    if (!candidate) return;
+    if (aiRepair.value?.candidateId === id) {
+      setAiView('ai');
+      return;
+    }
+    busy.value = true;
+    busyText.value = '载入 AI 图…';
+    try {
+      // 从历史中选中时也保持与生成/上传一致的默认：无选区则按差异自动生成
+      await activateAiCandidate(candidate, { autoRegion: !hasSelection.value });
+    } finally {
+      busy.value = false;
+      busyText.value = '';
+    }
+  }
+
+  async function deleteAiCandidate(id: string): Promise<void> {
+    if (busy.value) return;
+    const img = activeImage.value;
+    const candidate = img?.aiCandidates?.find((c) => c.id === id);
+    if (!img || !candidate) return;
+    try {
+      await ElMessageBox.confirm(
+        `删除 AI 图「${candidate.name}」？保存项目后，磁盘上的对应文件也会被清理。`,
+        '删除 AI 图',
+        { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' },
+      );
+    } catch {
+      return;
+    }
+    img.aiCandidates = img.aiCandidates.filter((c) => c.id !== id);
+    aiCandidateVersion.value++;
+    bumpData();
+    if (aiRepair.value?.candidateId === id) closeAiRepair();
+    ElMessage.success('已删除 AI 图');
+  }
+
+  /** 上传用户自己的 AI 图，走与生成结果相同的对比/合并流程 */
+  async function uploadAiCandidate(file: File): Promise<void> {
+    if (!hasImage.value || busy.value) return;
+    if (!file.type.startsWith('image/')) {
+      ElMessage.warning('请选择图片文件（PNG / JPEG / WebP 等）');
+      return;
+    }
+    busy.value = true;
+    busyText.value = '载入本地 AI 图…';
+    try {
+      const bitmap = await createImageBitmap(file);
+      const name = file.name.replace(/\.[^.]+$/, '') || '本地 AI 图';
+      await addAiCandidateFromBitmap(bitmap, { source: 'uploaded', name, prompt: '' });
+      ElMessage.success('已加入 AI 图历史，可切换「AI 图 / 差异区域」查看并应用');
+    } catch (err) {
+      ElMessage.error(`载入本地 AI 图失败：${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      busy.value = false;
+      busyText.value = '';
+    }
+  }
+
+  /** 生成 AI 修复图（需联网：openlux；Key 由后端读取） */
+  async function startAiRepair(prompt: string): Promise<void> {
+    if (!editedCanvas || busy.value) return;
+    const text = prompt.trim();
+    if (!text) {
+      ElMessage.warning('请先填写修复描述');
+      return;
+    }
+    if (!aiPrivacyConfirmed) {
+      try {
+        await ElMessageBox.confirm(
+          'AI 修复会把当前图片上传至 openlux.ai 生成结果（云端服务），可能消耗你的额度。是否继续？',
+          'AI 修复 · 隐私提示',
+          { confirmButtonText: '继续生成', cancelButtonText: '取消', type: 'warning' },
+        );
+        aiPrivacyConfirmed = true;
+      } catch {
+        return;
+      }
+    }
+    const canvas = editedCanvas;
+    await runTaskFlow(
+      async () => requestAiRepair(await canvasToBlob(canvas, 'image/png'), text),
+      'AI 修复生成',
+      async (taskId) => {
+        const blob = await fetchTaskResult(taskId);
+        const bitmap = await createImageBitmap(blob);
+        await addAiCandidateFromBitmap(bitmap, {
+          source: 'generated',
+          name: text.length > 32 ? `${text.slice(0, 32)}…` : text,
+          prompt: text,
+        });
+      },
+      'AI 修复图已生成并加入「AI 图历史」，可随时切换对比',
+    );
+  }
+
+  /** 重新选择区域：画布切换为 AI 图并显示当前选区供加减 */
+  function prepareAiRepairAdjust(): void {
+    const state = aiRepair.value;
+    if (!state) return;
+    aiRepair.value = { ...state, phase: 'adjust' };
+    setAiView('ai');
+  }
+
+  async function resetAiRegion(): Promise<void> {
+    await computeDiffRegion();
+  }
+
+  /** 应用 AI 修复：仅区域内（按蒙版软边缘合成）或全图替换 */
+  async function applyAiRepair(scope: 'region' | 'whole'): Promise<void> {
+    const repair = aiRepair.value;
+    const ctx = editedCtx;
+    const canvas = editedCanvas;
+    const hist = history;
+    const mm = maskManager;
+    if (!repair || !ctx || !canvas || !hist || !mm || busy.value) return;
+    if (scope === 'region' && !hasSelection.value) {
+      const ok = await computeDiffRegion();
+      if (!ok) {
+        ElMessage.warning('没有可用的区域：请先在画布上选择要应用 AI 结果的范围');
+        return;
+      }
+    }
+    busy.value = true;
+    busyText.value = '应用 AI 修复…';
+    try {
+      const w = imageWidth.value;
+      const h = imageHeight.value;
+      if (scope === 'whole') {
+        ctx.clearRect(0, 0, w, h);
+        ctx.drawImage(repair.aiCanvas, 0, 0);
+      } else {
+        const layer = document.createElement('canvas');
+        layer.width = w;
+        layer.height = h;
+        const lctx = layer.getContext('2d')!;
+        lctx.drawImage(repair.aiCanvas, 0, 0);
+        lctx.globalCompositeOperation = 'destination-in';
+        lctx.drawImage(mm.canvas, 0, 0);
+        ctx.drawImage(layer, 0, 0);
+      }
+      imageVersion.value++;
+      const snap = await canvasToBlob(canvas, 'image/png');
+      const thumb = await makeThumbnail(canvas, w, h);
+      const node = hist.addEdit(
+        { type: 'ai_repair', params: { prompt: repair.prompt, scope } },
+        snap,
+        thumb,
+      );
+      recordEditOp(scope === 'whole' ? 'AI 修复（全图）' : 'AI 修复（区域）', node);
+      const img = activeImage.value;
+      if (img) {
+        img.currentId = hist.currentId;
+        if (thumb) img.thumbBlob = thumb;
+      }
+      historyVersion.value++;
+      currentHistoryId.value = hist.currentId;
+      updateHistoryFlags();
+      bumpData();
+      ElMessage.success(
+        scope === 'whole' ? '已用 AI 图替换全图' : '已将 AI 修改应用到选区（区域外保持不变）',
+      );
+      closeAiRepair();
+    } catch (err) {
+      ElMessage.error(`应用 AI 修复失败：${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      busy.value = false;
+      busyText.value = '';
+    }
+  }
+
   // ---------- 阶段三：魔棒 / 蒙版后处理 / 渐变 / 邻域填充 ----------
 
   async function magicWandAt(x: number, y: number, mode: CombineMode): Promise<void> {
@@ -1599,6 +2001,19 @@ export const useEditorStore = defineStore('editor', () => {
     );
   }
 
+  /** 抚平褶皱：对当前选区做频率抚平（低频阴影压平 + 高频纹理保留） */
+  async function flattenWrinkles(): Promise<void> {
+    await applyEdit(
+      {
+        type: 'flatten_wrinkles',
+        strength: flattenStrength.value / 100,
+        scale: flattenScale.value,
+        textureKeep: flattenTextureKeep.value / 100,
+      },
+      '抚平褶皱',
+    );
+  }
+
   async function neighborhoodFill(): Promise<void> {
     if (!editedCanvas || !editedCtx || !maskManager || !history || busy.value) return;
     if (!hasSelection.value) {
@@ -1676,14 +2091,23 @@ export const useEditorStore = defineStore('editor', () => {
 
   /** 计算当前设置下的目标色（选区/区域的均值或众数、取色点、手动色） */
   function computeShiftTargetColor(): [number, number, number] | null {
-    if (shiftTargetSource.value === 'manual') return hexToRgb(shiftManualColor.value);
-    if (shiftTargetSource.value === 'pick') return shiftPickedColor.value;
-    const gray = getShiftTargetGray();
-    const pixels = ensureShiftPixelCache();
-    if (!gray || !pixels) return null;
-    return shiftTargetMode.value === 'mode'
-      ? maskedModeColor(pixels, gray)
-      : maskedMeanColor(pixels, gray);
+    let color: [number, number, number] | null;
+    if (shiftTargetSource.value === 'manual') {
+      color = hexToRgb(shiftManualColor.value);
+    } else if (shiftTargetSource.value === 'pick') {
+      color = shiftPickedColor.value;
+    } else {
+      const gray = getShiftTargetGray();
+      const pixels = ensureShiftPixelCache();
+      if (!gray || !pixels) return null;
+      color =
+        shiftTargetMode.value === 'mode'
+          ? maskedModeColor(pixels, gray)
+          : maskedMeanColor(pixels, gray);
+    }
+    // 取色点保存在 ref 中会被 Vue 包装为响应式 Proxy，直接 postMessage 给 Worker 会
+    // 抛 "could not be cloned"；统一复制成普通数组再返回。
+    return color ? [color[0], color[1], color[2]] : null;
   }
 
   /** 目标区域在 Lab 空间的颜色标准差（分布匹配用），采样步长 4 降低主线程开销 */
@@ -1972,56 +2396,102 @@ export const useEditorStore = defineStore('editor', () => {
           thumb: img.thumbBlob || img.thumbUrl ? blobName.imageThumb(img.id) : null,
           nodes: [],
           regions: [],
+          aiCandidates: [],
         };
         needUpload(manifestImage.original, img.originalBlob);
         if (manifestImage.thumb) needUpload(manifestImage.thumb, img.thumbBlob);
-        if (img.history) {
-          for (const node of img.history.allNodes()) {
-            const manifestNode: ManifestNode = {
-              id: node.id,
-              parentId: node.parentId,
-              childIds: [...node.childIds],
-              op: node.op,
-              time: node.time,
-              label: node.label,
-              regionIds: [...(node.regionIds ?? [])],
-              snapshot: blobName.snapshot(img.id, node.id),
-              thumb: node.thumbBlob || node.thumbUrl ? blobName.nodeThumb(img.id, node.id) : null,
-            };
-            needUpload(manifestNode.snapshot, node.imageBlob);
-            if (manifestNode.thumb) needUpload(manifestNode.thumb, node.thumbBlob);
-            manifestImage.nodes.push(manifestNode);
-            nodeCount++;
+        // 本次会话从未载入的图片：原样沿用磁盘清单中的历史与区域，
+        // 否则保存时会把未打开图片的版本树/区域清空并触发服务端清理 Blob。
+        const rawImage =
+          !img.history && openedProject?.project.id === activeRow.id
+            ? openedProject.manifest.images.find((m) => m.id === img.id)
+            : undefined;
+        if (rawImage) {
+          manifestImage.nodes = rawImage.nodes.map((node) => ({
+            ...node,
+            childIds: [...node.childIds],
+            regionIds: [...(node.regionIds ?? [])],
+          }));
+          manifestImage.regions = rawImage.regions.map((region) => ({ ...region }));
+          for (const node of rawImage.nodes) {
+            referenced.add(node.snapshot);
+            if (node.thumb) referenced.add(node.thumb);
           }
-        }
-        if (img.regionRegistry) {
-          // 只保存仍被某个历史版本引用的区域；区域与版本的归属通过节点 regionIds 记录
-          const referencedRegions = new Set<string>();
+          for (const region of rawImage.regions) {
+            referenced.add(region.gray);
+            if (region.thumb) referenced.add(region.thumb);
+          }
+          nodeCount += rawImage.nodes.length;
+        } else {
           if (img.history) {
             for (const node of img.history.allNodes()) {
-              for (const id of node.regionIds ?? []) referencedRegions.add(id);
+              const manifestNode: ManifestNode = {
+                id: node.id,
+                parentId: node.parentId,
+                childIds: [...node.childIds],
+                op: node.op,
+                time: node.time,
+                label: node.label,
+                regionIds: [...(node.regionIds ?? [])],
+                snapshot: blobName.snapshot(img.id, node.id),
+                thumb: node.thumbBlob || node.thumbUrl ? blobName.nodeThumb(img.id, node.id) : null,
+              };
+              needUpload(manifestNode.snapshot, node.imageBlob);
+              if (manifestNode.thumb) needUpload(manifestNode.thumb, node.thumbBlob);
+              manifestImage.nodes.push(manifestNode);
+              nodeCount++;
             }
           }
-          let order = 0;
-          for (const region of img.regionRegistry) {
-            if (!referencedRegions.has(region.id)) continue;
-            const manifestRegion: ManifestRegion = {
-              id: region.id,
-              name: region.name,
-              locked: region.locked,
-              order: order++,
-              gray: blobName.regionGray(region.id),
-              thumb: region.thumbBlob || region.thumbUrl ? blobName.regionThumb(region.id) : null,
-            };
-            referenced.add(manifestRegion.gray);
-            if (!serverBlobNames.has(manifestRegion.gray)) {
-              files.push(
-                new File([await grayMaskToPngBlob(region.gray, img.width, img.height)], manifestRegion.gray),
-              );
+          if (img.regionRegistry) {
+            // 只保存仍被某个历史版本引用的区域；区域与版本的归属通过节点 regionIds 记录
+            const referencedRegions = new Set<string>();
+            if (img.history) {
+              for (const node of img.history.allNodes()) {
+                for (const id of node.regionIds ?? []) referencedRegions.add(id);
+              }
             }
-            if (manifestRegion.thumb) needUpload(manifestRegion.thumb, region.thumbBlob);
-            manifestImage.regions.push(manifestRegion);
+            let order = 0;
+            for (const region of img.regionRegistry) {
+              if (!referencedRegions.has(region.id)) continue;
+              const manifestRegion: ManifestRegion = {
+                id: region.id,
+                name: region.name,
+                locked: region.locked,
+                order: order++,
+                gray: blobName.regionGray(region.id),
+                thumb: region.thumbBlob || region.thumbUrl ? blobName.regionThumb(region.id) : null,
+              };
+              referenced.add(manifestRegion.gray);
+              if (!serverBlobNames.has(manifestRegion.gray)) {
+                files.push(
+                  new File([await grayMaskToPngBlob(region.gray, img.width, img.height)], manifestRegion.gray),
+                );
+              }
+              if (manifestRegion.thumb) needUpload(manifestRegion.thumb, region.thumbBlob);
+              manifestImage.regions.push(manifestRegion);
+            }
           }
+        }
+        // AI 候选图：生成或上传后保留，随项目清单持久化
+        for (const candidate of img.aiCandidates ?? []) {
+          const imageName = blobName.aiCandidate(img.id, candidate.id);
+          const thumbName =
+            candidate.thumbBlob || candidate.thumbUrl
+              ? blobName.aiCandidateThumb(img.id, candidate.id)
+              : null;
+          manifestImage.aiCandidates.push({
+            id: candidate.id,
+            source: candidate.source,
+            name: candidate.name,
+            prompt: candidate.prompt,
+            createdAt: candidate.createdAt,
+            sourceW: candidate.sourceW,
+            sourceH: candidate.sourceH,
+            image: imageName,
+            thumb: thumbName,
+          });
+          needUpload(imageName, candidate.blob);
+          if (thumbName) needUpload(thumbName, candidate.thumbBlob);
         }
         images.push(manifestImage);
       }
@@ -2118,6 +2588,7 @@ export const useEditorStore = defineStore('editor', () => {
             thumb: row.thumbBlob ? blobName.imageThumb(row.id) : null,
             nodes: [],
             regions: [],
+            aiCandidates: [],
           };
           pendingFiles.push(new File([row.originalBlob], manifestImage.original));
           if (manifestImage.thumb && row.thumbBlob) {
@@ -2491,6 +2962,19 @@ export const useEditorStore = defineStore('editor', () => {
     textSegment,
     runPointSegment,
     cancelAiTask,
+    // AI 修复
+    aiRepair,
+    aiView,
+    aiCandidates,
+    startAiRepair,
+    uploadAiCandidate,
+    selectAiCandidate,
+    deleteAiCandidate,
+    setAiView,
+    prepareAiRepairAdjust,
+    resetAiRegion,
+    applyAiRepair,
+    closeAiRepair,
     // 插入
     insertState,
     insertScale,
@@ -2513,6 +2997,10 @@ export const useEditorStore = defineStore('editor', () => {
     exportBackground,
     // 选区显示模式（跨项目记忆）
     maskDisplayMode,
+    // 抚平褶皱（跨项目记忆）
+    flattenStrength,
+    flattenScale,
+    flattenTextureKeep,
     // 阶段三参数
     wandTolerance,
     wandContiguous,
@@ -2537,6 +3025,7 @@ export const useEditorStore = defineStore('editor', () => {
     shrinkMask,
     smoothMaskEdge,
     gradientFill,
+    flattenWrinkles,
     neighborhoodFill,
     // 色彩靠近
     shiftApplyToRegionId,

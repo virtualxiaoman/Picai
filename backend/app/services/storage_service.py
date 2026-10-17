@@ -71,6 +71,11 @@ def referenced_blob_names(manifest: dict) -> set[str]:
                 value = region.get(key)
                 if value:
                     names.add(str(value))
+        for candidate in image.get('aiCandidates') or []:
+            for key in ('image', 'thumb'):
+                value = candidate.get(key)
+                if value:
+                    names.add(str(value))
     return names
 
 

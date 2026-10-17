@@ -2,7 +2,7 @@
 
 /** 像素运算 Worker：编辑操作、魔棒、蒙版后处理都在此执行，避免阻塞界面 */
 
-import { applyPixelOp, featherGray, magicWand, morphGray } from '../core/pixelOps';
+import { applyPixelOp, diffMask, featherGray, magicWand, morphGray } from '../core/pixelOps';
 import type { MaskOpKind, PixelOp } from '../types';
 
 interface ApplyMessage {
@@ -38,7 +38,15 @@ interface MaskOpMessage {
   radius: number;
 }
 
-type RequestMessage = ApplyMessage | MagicWandMessage | MaskOpMessage;
+interface DiffMaskMessage {
+  id: number;
+  kind: 'diff-mask';
+  original: ArrayBuffer;
+  modified: ArrayBuffer;
+  threshold: number;
+}
+
+type RequestMessage = ApplyMessage | MagicWandMessage | MaskOpMessage | DiffMaskMessage;
 
 const worker = self as unknown as DedicatedWorkerGlobalScope;
 
@@ -60,6 +68,11 @@ worker.onmessage = (event: MessageEvent<RequestMessage>) => {
         seedX: msg.seedX,
         seedY: msg.seedY,
       });
+      buffer = gray.buffer;
+    } else if (msg.kind === 'diff-mask') {
+      const original = new Uint8ClampedArray(msg.original);
+      const modified = new Uint8ClampedArray(msg.modified);
+      const gray = diffMask(original, modified, msg.threshold);
       buffer = gray.buffer;
     } else {
       const gray = new Uint8ClampedArray(msg.gray);

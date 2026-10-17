@@ -175,6 +175,8 @@ function defaultLabel(op: HistoryOp): string {
     neighborhood_fill: '邻域渐变填充',
     insert_image: '插入图片',
     color_shift: '色彩靠近',
+    flatten_wrinkles: '抚平褶皱',
+    ai_repair: 'AI 修复',
     import: '原图',
   };
   return map[op.type] ?? op.type;

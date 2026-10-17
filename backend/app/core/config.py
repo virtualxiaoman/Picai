@@ -37,6 +37,18 @@ class Settings(BaseSettings):
     # 项目历史数据磁盘存储根目录（每个项目一个子文件夹）
     storage_root: Path = PROJECT_ROOT / "data" / "history"
 
+    # AI 修复（openlux，OpenAI 兼容图像编辑接口）
+    openlux_base_url: str = "https://api.openlux.ai"
+    openlux_edits_path: str = "/v1/images/edits"
+    openlux_model: str = "gpt-image-2"
+    openlux_quality: str = "high"
+    # 优先按原图分辨率请求；服务不支持时自动回退到最接近的支持尺寸（由前端缩放回原图）
+    openlux_prefer_original_size: bool = True
+    # API Key 文件（纯文本，sk- 开头）；也可用 PICAI_OPENLUX_KEY_FILE 覆盖
+    openlux_key_file: Path = Path(
+        r"C:\Users\Administrator\AppData\Roaming\xiaoman\Picai\cookie\openlux.txt"
+    )
+
     @property
     def frontend_dist(self) -> Path:
         return PROJECT_ROOT / "frontend" / "dist"

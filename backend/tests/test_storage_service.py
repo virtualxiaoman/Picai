@@ -68,6 +68,19 @@ def make_manifest(project_id: str, name: str, active_image: str | None = None) -
                         'thumb': 'rg-1.thumb',
                     }
                 ],
+                'aiCandidates': [
+                    {
+                        'id': 'ai-1',
+                        'source': 'generated',
+                        'name': '去褶皱',
+                        'prompt': '去褶皱',
+                        'createdAt': 3,
+                        'sourceW': 100,
+                        'sourceH': 50,
+                        'image': 'img-1.ai-1.png',
+                        'thumb': 'img-1.ai-1.thumb',
+                    }
+                ],
             }
         ],
     }
@@ -161,6 +174,8 @@ def test_referenced_names_collects_all(storage):
         'img-1.n2.snapshot',
         'rg-1.gray',
         'rg-1.thumb',
+        'img-1.ai-1.png',
+        'img-1.ai-1.thumb',
     }
 
 

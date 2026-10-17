@@ -27,6 +27,12 @@ const tools: ToolDef[] = [
     svg: '<rect x="4.5" y="4.5" width="15" height="15" rx="1" fill="none" stroke="currentColor" stroke-width="1.8"/><rect x="10" y="10" width="4" height="4" fill="currentColor"/>',
   },
   {
+    id: 'brush-eraser',
+    label: '橡皮擦',
+    tooltip: '橡皮擦：从选区中擦除（只减不增）；[ ] 调整尺寸',
+    svg: '<circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M6.8 17.2L17.2 6.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
+  },
+  {
     id: 'marquee-rect',
     label: '矩形选区',
     tooltip: '矩形选区：拖动创建矩形选区',

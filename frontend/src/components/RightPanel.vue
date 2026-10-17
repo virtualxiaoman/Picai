@@ -1,13 +1,56 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { ElMessageBox } from 'element-plus';
-import { useEditorStore, type Region } from '../stores/editor';
+import { useEditorStore, type AiCandidate, type Region } from '../stores/editor';
+import { getAiStatus, type AiStatus } from '../api/client';
 import { hexToRgb } from '../core/pixelOps';
 import ParamSlider from './ParamSlider.vue';
 import type { CombineMode, ToolId } from '../types';
 
 const store = useEditorStore();
 const textPrompt = ref('');
+
+// AI 修复
+const aiPrompt = ref('');
+const aiStatus = ref<AiStatus | null>(null);
+const aiFileInput = ref<HTMLInputElement | null>(null);
+onMounted(async () => {
+  try {
+    aiStatus.value = await getAiStatus();
+  } catch {
+    aiStatus.value = { configured: false, key_file: '', message: '后端未启动，AI 修复不可用' };
+  }
+});
+
+const aiCandidateUrls = new Map<string, string>();
+function candidateThumbUrl(candidate: AiCandidate): string | null {
+  if (candidate.thumbUrl) return candidate.thumbUrl;
+  if (!candidate.thumbBlob) return null;
+  let url = aiCandidateUrls.get(candidate.id);
+  if (!url) {
+    url = URL.createObjectURL(candidate.thumbBlob);
+    aiCandidateUrls.set(candidate.id, url);
+  }
+  return url;
+}
+
+function formatCandidateTime(ts: number): string {
+  const d = new Date(ts);
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+async function onAiFilePicked(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = '';
+  if (file) await store.uploadAiCandidate(file);
+}
+
+onBeforeUnmount(() => {
+  for (const url of aiCandidateUrls.values()) URL.revokeObjectURL(url);
+  aiCandidateUrls.clear();
+});
 
 // ---------- 折叠分组状态（localStorage 记忆展开/收起） ----------
 const SECTION_KEY = 'picai.panel.sections';
@@ -17,7 +60,9 @@ const defaultSections: Record<string, boolean> = {
   tool: true,
   maskAdjust: false,
   fill: false,
+  flatten: false,
   colorShift: false,
+  aiRepair: false,
   gradient: false,
   inpaint: false,
 };
@@ -56,6 +101,7 @@ const toolLabel = computed(() => {
   const map: Record<ToolId, string> = {
     'brush-circle': '圆形画笔',
     'brush-square': '方形画笔',
+    'brush-eraser': '橡皮擦',
     'marquee-rect': '矩形选区',
     'marquee-ellipse': '椭圆选区',
     'ai-remove-bg': '自动抠图（BiRefNet）',
@@ -73,6 +119,7 @@ const toolHintText = computed(() => {
       '拖动涂抹形成连续笔迹；按住 Ctrl（或 Shift）临时增加、Alt 临时减去；[ ] 调整尺寸',
     'brush-square':
       '拖动涂抹形成连续笔迹；按住 Ctrl（或 Shift）临时增加、Alt 临时减去；[ ] 调整尺寸',
+    'brush-eraser': '拖动擦除选区中的区域（只减不增）；[ ] 调整尺寸',
     'marquee-rect':
       '拖动创建选区；Ctrl（或 Shift）增加、Alt 减去、Shift+Alt 交集；Shift 约束正方形/正圆',
     'marquee-ellipse':
@@ -143,6 +190,7 @@ onBeforeUnmount(() => {
 });
 
 const isBrush = computed(() => store.activeTool.startsWith('brush'));
+const isEraser = computed(() => store.activeTool === 'brush-eraser');
 const isMarquee = computed(() => store.activeTool.startsWith('marquee'));
 const isAiRemoveBg = computed(() => store.activeTool === 'ai-remove-bg');
 const isAiObject = computed(() => store.activeTool === 'ai-object');
@@ -377,7 +425,7 @@ async function applyTransparent(): Promise<void> {
         <template v-if="isBrush">
           <ParamSlider v-model="store.brushSize" label="尺寸（图像像素）" unit="px" :min="1" :max="1000" />
           <ParamSlider v-model="store.brushHardness" label="硬度" unit="%" :min="0" :max="100" :show-range="false" />
-          <div class="field">
+          <div v-if="!isEraser" class="field">
             <label>模式</label>
             <el-radio-group v-model="store.brushMode" size="small">
               <el-radio-button v-for="opt in brushModeOptions" :key="opt.value" :value="opt.value">
@@ -560,6 +608,50 @@ async function applyTransparent(): Promise<void> {
             透明化
           </el-button>
         </div>
+      </div>
+    </section>
+
+    <!-- 抚平褶皱 -->
+    <section class="panel-section">
+      <el-tooltip
+        content="对衣物等表面的褶皱做频率抚平：压平低频阴影/褶皱起伏，保留高频布料纹理。建议先用选择工具（或固定区域）选中衣物范围；强褶皱可调大「褶皱尺度」后重复执行。这是基于频率分解的调整，不是生成式内容修复。"
+        placement="left"
+        popper-class="panel-hint-tooltip"
+        :show-after="250"
+      >
+        <button class="section-header" :class="{ open: sections.flatten }" @click="toggleSection('flatten')">
+          <span class="section-title">抚平褶皱</span>
+          <span class="section-caret">▾</span>
+        </button>
+      </el-tooltip>
+      <div v-if="sections.flatten" class="section-body">
+        <ParamSlider
+          v-model="store.flattenStrength"
+          label="抚平强度"
+          unit="%"
+          :min="0"
+          :max="100"
+          :show-range="false"
+        />
+        <ParamSlider v-model="store.flattenScale" label="褶皱尺度" unit="px" :min="5" :max="300" />
+        <ParamSlider
+          v-model="store.flattenTextureKeep"
+          label="纹理保留"
+          unit="%"
+          :min="0"
+          :max="100"
+          :show-range="false"
+        />
+        <el-button
+          type="primary"
+          size="small"
+          :disabled="!store.hasSelection || store.busy"
+          :loading="store.busy"
+          @click="store.flattenWrinkles()"
+        >
+          抚平选区褶皱
+        </el-button>
+        <p class="hint">低频压平、高频纹理保留；可多次执行或用 Ctrl+Z 撤销</p>
       </div>
     </section>
 
@@ -756,6 +848,175 @@ async function applyTransparent(): Promise<void> {
         >
           执行邻域填充
         </el-button>
+      </div>
+    </section>
+
+    <!-- AI 修复 -->
+    <section class="panel-section">
+      <el-tooltip
+        content="AI 修复（openlux 云端，gpt-image-2）：可填写描述云端生成，也可上传自己在别处生成的 AI 图；两者都会加入「AI 图历史」并随项目保存，可随时切换对比或重新应用。图片会上传至云端生成（仅云端生成时），首次使用需确认。生成/上传后可用按钮在主画布切换查看「原图 / AI 图 / 差异区域」。合并方式：仅保留区域内修改 = 按选区软边缘合成、区域外不变；保留全图修改 = 整图替换；重新选择区域 = 在画布上用画笔加选、橡皮擦减选后再应用。未选择区域时会自动按原图与 AI 图的差异生成区域；AI 分辨率与原图不一致时自动按原图比例缩放并提示。"
+        placement="left"
+        popper-class="panel-hint-tooltip"
+        :show-after="250"
+      >
+        <button class="section-header" :class="{ open: sections.aiRepair }" @click="toggleSection('aiRepair')">
+          <span class="section-title">AI 修复</span>
+          <span class="section-caret">▾</span>
+        </button>
+      </el-tooltip>
+      <div v-if="sections.aiRepair" class="section-body">
+        <div class="field">
+          <label>修复描述</label>
+          <el-input
+            v-model="aiPrompt"
+            type="textarea"
+            :rows="2"
+            size="small"
+            placeholder="例如：把皮肤调白、去掉衣服褶皱、修复破损细节"
+          />
+        </div>
+        <div class="row">
+          <el-button
+            type="primary"
+            size="small"
+            :disabled="!store.hasImage || store.busy || !aiPrompt.trim()"
+            :loading="store.busy"
+            @click="store.startAiRepair(aiPrompt)"
+          >
+            生成修复图
+          </el-button>
+          <el-button
+            size="small"
+            :disabled="!store.hasImage || store.busy"
+            @click="aiFileInput?.click()"
+          >
+            上传本地 AI 图
+          </el-button>
+          <input
+            ref="aiFileInput"
+            type="file"
+            accept="image/*"
+            hidden
+            @change="onAiFilePicked"
+          />
+        </div>
+        <p v-if="aiStatus && !aiStatus.configured" class="hint" style="color: #e6a23c">
+          {{ aiStatus.message }}
+          <template v-if="aiStatus.key_file">（{{ aiStatus.key_file }}）</template>
+        </p>
+
+        <div class="field" style="margin-top: 8px">
+          <label>AI 图历史（随项目保存）</label>
+          <div v-if="store.aiCandidates.length > 0" class="ai-candidate-list">
+            <div
+              v-for="candidate in store.aiCandidates"
+              :key="candidate.id"
+              class="ai-candidate"
+              :class="{ active: store.aiRepair?.candidateId === candidate.id }"
+              :title="candidate.prompt || candidate.name"
+              @click="store.selectAiCandidate(candidate.id)"
+            >
+              <img
+                v-if="candidateThumbUrl(candidate)"
+                :src="candidateThumbUrl(candidate)!"
+                class="ai-candidate-thumb"
+                alt=""
+              />
+              <span v-else class="ai-candidate-thumb placeholder">AI</span>
+              <span class="ai-candidate-meta">
+                <span class="ai-candidate-name">{{ candidate.name }}</span>
+                <span class="ai-candidate-sub">
+                  {{ candidate.source === 'uploaded' ? '上传' : '生成' }} ·
+                  {{ formatCandidateTime(candidate.createdAt) }}
+                  <template v-if="candidate.sourceW !== store.imageWidth || candidate.sourceH !== store.imageHeight">
+                    · 已缩放
+                  </template>
+                </span>
+              </span>
+              <el-button
+                class="ai-candidate-del"
+                size="small"
+                text
+                :disabled="store.busy"
+                @click.stop="store.deleteAiCandidate(candidate.id)"
+              >
+                ✕
+              </el-button>
+            </div>
+          </div>
+          <p v-else class="hint" style="margin: 2px 0 0">
+            生成或上传的 AI 图会保留在这里，点击可随时切换对比；保存项目后写入磁盘。
+          </p>
+        </div>
+
+        <template v-if="store.aiRepair">
+          <div class="field" style="margin-top: 10px">
+            <label>画布查看</label>
+            <el-radio-group
+              :model-value="store.aiView"
+              size="small"
+              @update:model-value="
+                (v: string | number | boolean | undefined) =>
+                  store.setAiView(v === 'ai' ? 'ai' : v === 'diff' ? 'diff' : 'original')
+              "
+            >
+              <el-radio-button value="original">原图</el-radio-button>
+              <el-radio-button value="ai">AI 图</el-radio-button>
+              <el-radio-button value="diff">差异区域</el-radio-button>
+            </el-radio-group>
+          </div>
+          <p v-if="store.aiRepair.scaled" class="hint" style="color: #e6a23c">
+            AI 返回 {{ store.aiRepair.sourceW }}×{{ store.aiRepair.sourceH }}，与原图不一致，已按原图比例缩放
+          </p>
+
+          <template v-if="store.aiRepair.phase === 'compare'">
+            <div class="row">
+              <el-button
+                type="primary"
+                size="small"
+                :disabled="!store.hasSelection || store.busy"
+                :loading="store.busy"
+                @click="store.applyAiRepair('region')"
+              >
+                仅保留区域内修改
+              </el-button>
+              <el-button size="small" :disabled="store.busy" @click="store.applyAiRepair('whole')">
+                保留全图修改
+              </el-button>
+            </div>
+            <div class="row" style="margin-top: 6px">
+              <el-button size="small" :disabled="store.busy" @click="store.prepareAiRepairAdjust()">
+                重新选择区域
+              </el-button>
+              <el-button size="small" text :disabled="store.busy" @click="store.closeAiRepair()">
+                取消
+              </el-button>
+            </div>
+          </template>
+
+          <template v-else>
+            <p class="hint" style="color: #7db4ff">
+              在画布上调整区域：画笔加选、橡皮擦减选，完成后点「应用（仅区域）」。
+            </p>
+            <div class="row">
+              <el-button
+                type="primary"
+                size="small"
+                :disabled="!store.hasSelection || store.busy"
+                :loading="store.busy"
+                @click="store.applyAiRepair('region')"
+              >
+                应用（仅区域）
+              </el-button>
+              <el-button size="small" :disabled="store.busy" @click="store.resetAiRegion()">
+                恢复为差异区域
+              </el-button>
+              <el-button size="small" text :disabled="store.busy" @click="store.closeAiRepair()">
+                取消
+              </el-button>
+            </div>
+          </template>
+        </template>
       </div>
     </section>
   </div>

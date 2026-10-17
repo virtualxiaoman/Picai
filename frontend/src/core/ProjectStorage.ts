@@ -23,6 +23,19 @@ export interface ProjectRow {
   imageCount: number;
 }
 
+export interface StoredAiCandidate {
+  id: string;
+  source: 'generated' | 'uploaded';
+  name: string;
+  prompt: string;
+  createdAt: number;
+  /** AI 图原始像素尺寸（可能被缩放到原图尺寸后保存） */
+  sourceW: number;
+  sourceH: number;
+  imageUrl: string;
+  thumbUrl: string | null;
+}
+
 export interface ImageRow {
   id: string;
   projectId: string;
@@ -34,6 +47,7 @@ export interface ImageRow {
   createdAt: number;
   originalUrl: string;
   thumbUrl: string | null;
+  aiCandidates: StoredAiCandidate[];
 }
 
 export interface ManifestNode {
@@ -57,6 +71,18 @@ export interface ManifestRegion {
   thumb: string | null;
 }
 
+export interface ManifestAiCandidate {
+  id: string;
+  source: 'generated' | 'uploaded';
+  name: string;
+  prompt: string;
+  createdAt: number;
+  sourceW: number;
+  sourceH: number;
+  image: string;
+  thumb: string | null;
+}
+
 export interface ManifestImage {
   id: string;
   name: string;
@@ -69,6 +95,8 @@ export interface ManifestImage {
   thumb: string | null;
   nodes: ManifestNode[];
   regions: ManifestRegion[];
+  /** 用户保留的 AI 候选图（生成/上传）；旧清单无此字段 */
+  aiCandidates: ManifestAiCandidate[];
 }
 
 export interface ProjectManifest {
@@ -92,6 +120,8 @@ export interface RegionRow {
 
 export interface OpenedProject {
   project: ProjectRow;
+  /** 原始清单：保存时可原样保留尚未载入内存的图片的历史节点与区域 */
+  manifest: ProjectManifest;
   images: ImageRow[];
   nodesOf(imageId: string): HistoryNode[];
   regionsOf(imageId: string): Promise<RegionRow[]>;
@@ -113,6 +143,8 @@ export const blobName = {
   nodeThumb: (imageId: string, nodeId: number) => `${imageId}.n${nodeId}.thumb`,
   regionGray: (regionId: string) => `${regionId}.gray`,
   regionThumb: (regionId: string) => `${regionId}.thumb`,
+  aiCandidate: (imageId: string, candidateId: string) => `${imageId}.${candidateId}.png`,
+  aiCandidateThumb: (imageId: string, candidateId: string) => `${imageId}.${candidateId}.thumb`,
 };
 
 async function toJson<T>(res: Response): Promise<T> {
@@ -180,6 +212,17 @@ export class ProjectStorage {
       createdAt: m.createdAt,
       originalUrl: this.blobUrl(folder, m.original),
       thumbUrl: m.thumb ? this.blobUrl(folder, m.thumb) : null,
+      aiCandidates: (m.aiCandidates ?? []).map((c) => ({
+        id: c.id,
+        source: c.source,
+        name: c.name,
+        prompt: c.prompt,
+        createdAt: c.createdAt,
+        sourceW: c.sourceW,
+        sourceH: c.sourceH,
+        imageUrl: this.blobUrl(folder, c.image),
+        thumbUrl: c.thumb ? this.blobUrl(folder, c.thumb) : null,
+      })),
     }));
     const nodesByImage = new Map<string, HistoryNode[]>();
     const regionsByImage = new Map<string, ManifestRegion[]>();
@@ -212,9 +255,14 @@ export class ProjectStorage {
         blobNames.add(r.gray);
         if (r.thumb) blobNames.add(r.thumb);
       }
+      for (const c of m.aiCandidates ?? []) {
+        blobNames.add(c.image);
+        if (c.thumb) blobNames.add(c.thumb);
+      }
     }
     return {
       project,
+      manifest,
       images,
       nodesOf: (imageId: string) => nodesByImage.get(imageId) ?? [],
       regionsOf: async (imageId: string) => {

@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from .api.routes_ai import router as ai_router
 from .api.routes_edit import router as edit_router
 from .api.routes_segmentation import router as segmentation_router
 from .api.routes_storage import router as storage_router
@@ -31,6 +32,7 @@ app.include_router(system_router, prefix="/api")
 app.include_router(segmentation_router, prefix="/api")
 app.include_router(edit_router, prefix="/api")
 app.include_router(storage_router, prefix="/api")
+app.include_router(ai_router, prefix="/api")
 
 # 生产模式：若前端已构建（frontend/dist），直接由后端托管
 if settings.frontend_dist.is_dir():

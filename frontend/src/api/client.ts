@@ -110,6 +110,25 @@ export function getModelsStatus(): Promise<ModelsStatus> {
   return request('/models/status');
 }
 
+// ---------- AI 修复（openlux，图片会上传至云端） ----------
+
+export function requestAiRepair(image: Blob, prompt: string): Promise<TaskState> {
+  return request('/ai/repair', {
+    method: 'POST',
+    body: imageForm(image, { prompt }),
+  });
+}
+
+export interface AiStatus {
+  configured: boolean;
+  key_file: string;
+  message: string;
+}
+
+export function getAiStatus(): Promise<AiStatus> {
+  return request('/ai/status');
+}
+
 // ---------- 图像编辑（后端整图操作） ----------
 
 export function requestNeighborhoodFill(

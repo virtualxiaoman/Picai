@@ -3,6 +3,7 @@ import {
   alphaToGray,
   applyPixelOp,
   colorDistance,
+  diffMask,
   featherGray,
   grayToRgba,
   hexToRgb,
@@ -435,6 +436,140 @@ describe('applyPixelOp color_shift：色彩靠近（保留原风格）', () => {
     const movedFull = fullShift[2] - source[2];
     expect(moved).toBeGreaterThan(movedFull * 0.35);
     expect(moved).toBeLessThan(movedFull * 0.65);
+  });
+});
+
+describe('applyPixelOp flatten_wrinkles：抚平褶皱（低频压平 + 纹理保留）', () => {
+  function grayscaleImage(
+    w: number,
+    h: number,
+    fn: (x: number, y: number) => number,
+  ): Uint8ClampedArray {
+    const px = new Uint8ClampedArray(w * h * 4);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const g = Math.min(255, Math.max(0, fn(x, y)));
+        const p = (y * w + x) * 4;
+        px[p] = g;
+        px[p + 1] = g;
+        px[p + 2] = g;
+        px[p + 3] = 255;
+      }
+    }
+    return px;
+  }
+
+  it('强度 0 时像素严格不变', () => {
+    const w = 32;
+    const h = 4;
+    const pixels = grayscaleImage(w, h, (x) => 100 + (x % 2 === 0 ? 8 : -8));
+    const before = [...pixels];
+    applyPixelOp(
+      pixels,
+      new Uint8ClampedArray(w * h).fill(255),
+      { type: 'flatten_wrinkles', strength: 0, scale: 16, textureKeep: 1 },
+      w,
+      h,
+    );
+    expect([...pixels]).toEqual(before);
+  });
+
+  it('低频明暗起伏被压平，高频纹理保留', () => {
+    const w = 128;
+    const h = 8;
+    // 大尺度亮度起伏（模拟褶皱阴影）+ 交替 ±6 的高频纹理
+    const shading = (x: number): number => 60 + Math.round(120 * Math.sin((x / w) * Math.PI));
+    const texture = (x: number): number => (x % 2 === 0 ? 6 : -6);
+    const pixels = grayscaleImage(w, h, (x) => shading(x) + texture(x));
+    const mask = new Uint8ClampedArray(w * h).fill(255);
+
+    applyPixelOp(
+      pixels,
+      mask,
+      { type: 'flatten_wrinkles', strength: 1, scale: 24, textureKeep: 1 },
+      w,
+      h,
+    );
+
+    // 各列均值（抹掉纹理后的低频）极差显著缩小 → 阴影被压平
+    const colMeans: number[] = [];
+    for (let x = 0; x < w; x++) {
+      let sum = 0;
+      for (let y = 0; y < h; y++) sum += pixels[(y * w + x) * 4];
+      colMeans.push(sum / h);
+    }
+    const spreadBefore = 180 - 60;
+    const spreadAfter = Math.max(...colMeans) - Math.min(...colMeans);
+    expect(spreadAfter).toBeLessThan(spreadBefore * 0.45);
+
+    // 相邻像素的高频纹理仍然存在
+    const row = 0;
+    const diff = Math.abs(pixels[(row * w + 1) * 4] - pixels[row * w * 4]);
+    expect(diff).toBeGreaterThan(4);
+  });
+
+  it('纹理保留为 0 时细节也被抹平', () => {
+    const w = 64;
+    const h = 4;
+    const pixels = grayscaleImage(w, h, (x) => 120 + (x % 2 === 0 ? 8 : -8));
+    applyPixelOp(
+      pixels,
+      new Uint8ClampedArray(w * h).fill(255),
+      { type: 'flatten_wrinkles', strength: 1, scale: 12, textureKeep: 0 },
+      w,
+      h,
+    );
+    const diff = Math.abs(pixels[1 * 4] - pixels[0]);
+    expect(diff).toBeLessThanOrEqual(2);
+  });
+
+  it('mask=0 的像素严格不变', () => {
+    const w = 16;
+    const h = 2;
+    const pixels = grayscaleImage(w, h, (x) => 90 + x * 4);
+    const mask = new Uint8ClampedArray(w * h);
+    // 只选左半部分
+    for (let y = 0; y < h; y++) for (let x = 0; x < w / 2; x++) mask[y * w + x] = 255;
+    const before: number[] = [];
+    for (let i = 0; i < w * h; i++) before.push(pixels[i * 4]);
+    applyPixelOp(
+      pixels,
+      mask,
+      { type: 'flatten_wrinkles', strength: 1, scale: 8, textureKeep: 1 },
+      w,
+      h,
+    );
+    for (let y = 0; y < h; y++) {
+      for (let x = w / 2; x < w; x++) {
+        expect(pixels[(y * w + x) * 4]).toBe(before[y * w + x]);
+      }
+    }
+  });
+});
+
+describe('diffMask：AI 前后差异区域', () => {
+  it('相同图片返回空蒙版', () => {
+    const pixels = new Uint8ClampedArray([100, 120, 140, 255, 30, 40, 50, 255]);
+    expect([...diffMask(pixels, pixels, 10)]).toEqual([0, 0]);
+  });
+
+  it('颜色差异超过阈值的像素被标记', () => {
+    const original = new Uint8ClampedArray([100, 120, 140, 255, 30, 40, 50, 255]);
+    const modified = new Uint8ClampedArray([100, 120, 140, 255, 200, 200, 200, 255]);
+    expect([...diffMask(original, modified, 10)]).toEqual([0, 255]);
+  });
+
+  it('阈值越大标记越少', () => {
+    const original = new Uint8ClampedArray([100, 100, 100, 255]);
+    const modified = new Uint8ClampedArray([112, 112, 112, 255]);
+    expect(diffMask(original, modified, 5)[0]).toBe(255);
+    expect(diffMask(original, modified, 40)[0]).toBe(0);
+  });
+
+  it('透明原图先按白底合成再比较（与发送 AI 的处理一致）', () => {
+    const transparent = new Uint8ClampedArray([0, 0, 0, 0]);
+    const white = new Uint8ClampedArray([255, 255, 255, 255]);
+    expect(diffMask(transparent, white, 10)[0]).toBe(0);
   });
 });
 

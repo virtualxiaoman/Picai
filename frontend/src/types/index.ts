@@ -2,6 +2,7 @@
 export type ToolId =
   | 'brush-circle'
   | 'brush-square'
+  | 'brush-eraser'
   | 'marquee-rect'
   | 'marquee-ellipse'
   | 'ai-remove-bg'
@@ -50,7 +51,24 @@ export interface ColorShiftOp {
   strength: number;
 }
 
-export type PixelOp = TransparentOp | SolidFillOp | GradientFillOp | ColorShiftOp;
+/**
+ * 抚平褶皱：频率分解——压平低频阴影/褶皱起伏，同时保留高频布料纹理。
+ * strength 0-1 压平程度；scale 为低频半径（图像像素，决定"什么算褶皱"）；
+ * textureKeep 0-1 高频纹理保留度。
+ */
+export interface FlattenWrinklesOp {
+  type: 'flatten_wrinkles';
+  strength: number;
+  scale: number;
+  textureKeep: number;
+}
+
+export type PixelOp =
+  | TransparentOp
+  | SolidFillOp
+  | GradientFillOp
+  | ColorShiftOp
+  | FlattenWrinklesOp;
 
 export type MaskOpKind = 'feather' | 'dilate' | 'erode';
 

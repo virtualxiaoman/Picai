@@ -58,6 +58,18 @@ export function applyPixelOp(
     applyColorShift(pixels, mask, op.target, strengthOf(op.strength), op.mode, op.targetStd);
     return;
   }
+  if (op.type === 'flatten_wrinkles') {
+    flattenWrinkles(
+      pixels,
+      mask,
+      width,
+      height,
+      op.strength,
+      op.scale,
+      op.textureKeep,
+    );
+    return;
+  }
   if (op.type === 'solid') {
     const [r, g, b] = op.color;
     for (let i = 0; i < count; i++) {
@@ -384,6 +396,139 @@ export function maskedModeColor(
   }
   if (best === -1) return null;
   return [sumR[best] / counts[best], sumG[best] / counts[best], sumB[best] / counts[best]];
+}
+
+// ---------- AI 前后差异蒙版 ----------
+
+/**
+ * 比较原图与 AI 结果，自动得到“被修改的区域”蒙版。
+ * 原图透明区域先按白底合成（与发送给 AI 服务端时的处理一致），再按感知颜色距离比较。
+ */
+export function diffMask(
+  original: Uint8ClampedArray,
+  modified: Uint8ClampedArray,
+  threshold: number,
+): Uint8ClampedArray<ArrayBuffer> {
+  const count = original.length / 4;
+  const out = new Uint8ClampedArray(count);
+  const limit = Math.max(0, threshold);
+  for (let i = 0; i < count; i++) {
+    const p = i * 4;
+    const alpha = original[p + 3] / 255;
+    const r = original[p] * alpha + 255 * (1 - alpha);
+    const g = original[p + 1] * alpha + 255 * (1 - alpha);
+    const b = original[p + 2] * alpha + 255 * (1 - alpha);
+    if (colorDistance(r, g, b, modified[p], modified[p + 1], modified[p + 2]) > limit) {
+      out[i] = 255;
+    }
+  }
+  return out;
+}
+
+// ---------- 抚平褶皱（频率分解） ----------
+
+/** 浮点灰度可分离盒模糊（用于提取低频照明/褶皱阴影） */
+function boxBlurFloat(
+  src: Float32Array,
+  dst: Float32Array,
+  width: number,
+  height: number,
+  radius: number,
+): void {
+  const r = Math.max(0, Math.round(radius));
+  if (r === 0) {
+    dst.set(src);
+    return;
+  }
+  const win = r * 2 + 1;
+  const tmp = new Float32Array(src.length);
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    let sum = 0;
+    for (let i = -r; i <= r; i++) sum += src[row + Math.min(width - 1, Math.max(0, i))];
+    for (let x = 0; x < width; x++) {
+      tmp[row + x] = sum / win;
+      const outIdx = Math.min(width - 1, Math.max(0, x - r));
+      const inIdx = Math.min(width - 1, Math.max(0, x + r + 1));
+      sum += src[row + inIdx] - src[row + outIdx];
+    }
+  }
+  for (let x = 0; x < width; x++) {
+    let sum = 0;
+    for (let i = -r; i <= r; i++) sum += tmp[Math.min(height - 1, Math.max(0, i)) * width + x];
+    for (let y = 0; y < height; y++) {
+      dst[y * width + x] = sum / win;
+      const outIdx = Math.min(height - 1, Math.max(0, y - r));
+      const inIdx = Math.min(height - 1, Math.max(0, y + r + 1));
+      sum += tmp[inIdx * width + x] - tmp[outIdx * width + x];
+    }
+  }
+}
+
+/**
+ * 抚平褶皱：亮度 = 低频（照明/褶皱阴影） + 高频（布料纹理）。
+ * 将低频向区域均值压平（strength），高频纹理按 textureKeep 保留，
+ * 按蒙版权重混合；颜色以亮度比例缩放（保持色相）。
+ */
+function flattenWrinkles(
+  pixels: Uint8ClampedArray,
+  mask: Uint8Array | Uint8ClampedArray,
+  width: number,
+  height: number,
+  strength: number,
+  scale: number,
+  textureKeep: number,
+): void {
+  const s = strengthOf(strength);
+  if (s === 0) return;
+  const keep = strengthOf(textureKeep);
+  const total = width * height;
+
+  const lum = new Float32Array(total);
+  for (let i = 0; i < total; i++) {
+    const p = i * 4;
+    lum[i] = 0.299 * pixels[p] + 0.587 * pixels[p + 1] + 0.114 * pixels[p + 2];
+  }
+
+  // 三遍盒模糊近似大半径高斯 → 低频
+  const passRadius = Math.max(1, Math.round(scale / 3));
+  let current: Float32Array = lum;
+  for (let pass = 0; pass < 3; pass++) {
+    const next = new Float32Array(total);
+    boxBlurFloat(current, next, width, height, passRadius);
+    current = next;
+  }
+  const low = current;
+
+  // 蒙版内低频均值 = 压平目标
+  let sum = 0;
+  let weight = 0;
+  for (let i = 0; i < total; i++) {
+    const m = mask[i];
+    if (m === 0) continue;
+    sum += low[i] * m;
+    weight += m;
+  }
+  if (weight === 0) return;
+  const meanLow = sum / weight;
+  const lowKeep = 1 - s;
+
+  for (let i = 0; i < total; i++) {
+    const m = mask[i];
+    if (m === 0) continue;
+    const L = lum[i];
+    if (L < 1) continue;
+    const detail = L - low[i];
+    const targetS = meanLow + (low[i] - meanLow) * lowKeep;
+    let targetL = targetS + detail * keep;
+    targetL = Math.min(255, Math.max(0, targetL));
+    const factor = Math.min(5, Math.max(0.2, targetL / L));
+    const w = m / 255;
+    const p = i * 4;
+    pixels[p] = pixels[p] + (pixels[p] * factor - pixels[p]) * w;
+    pixels[p + 1] = pixels[p + 1] + (pixels[p + 1] * factor - pixels[p + 1]) * w;
+    pixels[p + 2] = pixels[p + 2] + (pixels[p + 2] * factor - pixels[p + 2]) * w;
+  }
 }
 
 // ---------- 蒙版后处理 ----------

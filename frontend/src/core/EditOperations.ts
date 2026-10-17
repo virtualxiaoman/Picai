@@ -62,8 +62,11 @@ export class EditOperations {
     width: number,
     height: number,
   ): Promise<Uint8ClampedArray<ArrayBuffer>> {
+    // op 可能携带来自 Vue ref 的响应式 Proxy（无法 structured clone），
+    // PixelOp 均为 JSON 安全值，先转为普通对象再发送。
+    const plainOp = JSON.parse(JSON.stringify(op)) as PixelOp;
     const buffer = await this.dispatch(
-      { kind: 'apply', op, pixels: pixels.buffer, mask: mask.buffer, width, height },
+      { kind: 'apply', op: plainOp, pixels: pixels.buffer, mask: mask.buffer, width, height },
       [pixels.buffer, mask.buffer],
     );
     return new Uint8ClampedArray(buffer);
@@ -85,6 +88,19 @@ export class EditOperations {
     const buffer = await this.dispatch(
       { kind: 'magic-wand', pixels: pixels.buffer, width, height, ...options },
       [pixels.buffer],
+    );
+    return new Uint8ClampedArray(buffer);
+  }
+
+  /** AI 差异蒙版：比较原图与 AI 结果（白底合成后按颜色距离阈值） */
+  async diffMask(
+    original: Uint8ClampedArray,
+    modified: Uint8ClampedArray,
+    threshold: number,
+  ): Promise<Uint8ClampedArray<ArrayBuffer>> {
+    const buffer = await this.dispatch(
+      { kind: 'diff-mask', original: original.buffer, modified: modified.buffer, threshold },
+      [original.buffer, modified.buffer],
     );
     return new Uint8ClampedArray(buffer);
   }

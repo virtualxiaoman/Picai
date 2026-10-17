@@ -32,7 +32,10 @@ const insertScalePercent = computed({
 });
 
 const isBrushTool = computed(
-  () => store.activeTool === 'brush-circle' || store.activeTool === 'brush-square',
+  () =>
+    store.activeTool === 'brush-circle' ||
+    store.activeTool === 'brush-square' ||
+    store.activeTool === 'brush-eraser',
 );
 const isMarqueeTool = computed(
   () => store.activeTool === 'marquee-rect' || store.activeTool === 'marquee-ellipse',
@@ -66,7 +69,7 @@ const previews = computed<ToolPreview[]>(() => {
   ) {
     list.push({
       kind: 'brush',
-      shape: store.activeTool === 'brush-circle' ? 'circle' : 'square',
+      shape: store.activeTool === 'brush-square' ? 'square' : 'circle',
       screenX: pointerScreen.value.x,
       screenY: pointerScreen.value.y,
       sizeImage: store.brushSize,
@@ -133,8 +136,18 @@ function doRender(): void {
       overlay = maskRenderer.canvas;
     }
   }
+  // AI 修复：画布按 AI 面板的视图按钮切换（原图 / AI 图 / 差异区域）
+  const aiRepairView =
+    store.aiRepair && store.aiView === 'ai'
+      ? store.aiRepair.aiCanvas
+      : store.aiRepair && store.aiView === 'diff'
+        ? store.aiRepair.diffCanvas
+        : null;
   const image = (regionsView ??
-    (store.showOriginal ? store.originalBitmap : store.getEditedCanvas())) as CanvasImageSource | null;
+    aiRepairView ??
+    (store.showOriginal ? store.originalBitmap : store.getEditedCanvas())) as
+    | CanvasImageSource
+    | null;
   renderer.render(canvas, container.clientWidth, container.clientHeight, {
     viewport: store.getViewport(),
     dpr: window.devicePixelRatio || 1,
@@ -158,6 +171,8 @@ watchEffect(() => {
   void store.showRegions;
   void store.regionPreviewId;
   void store.maskDisplayMode;
+  void store.aiView;
+  void store.aiRepair;
   void store.insertState;
   void previews.value;
   requestRender();
@@ -209,9 +224,11 @@ function onPointerDown(event: PointerEvent): void {
     return;
   }
   if (isBrushTool.value) {
-    // Ctrl / Shift = 并集，Alt = 减去（与魔棒、几何选区统一）
-    const mode = resolveCombineMode(event, store.brushMode);
-    store.startBrushStroke(store.activeTool === 'brush-circle' ? 'circle' : 'square', mode);
+    // 橡皮擦只减不增；普通画笔 Ctrl/Shift = 并集、Alt = 减去（与魔棒统一）
+    const eraser = store.activeTool === 'brush-eraser';
+    const mode = eraser ? 'subtract' : resolveCombineMode(event, store.brushMode);
+    const shape = store.activeTool === 'brush-square' ? 'square' : 'circle';
+    store.startBrushStroke(shape, mode);
     store.brushStrokeTo(img.x, img.y);
     drag.value = 'brush';
     requestRender();
